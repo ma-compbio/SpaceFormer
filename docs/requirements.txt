@@ -5,3 +5,4 @@ squidpy
 numpy
 scipy
 tensorboardX
+sphinx_rtd_theme
