@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools >= 61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spaceformer"
+version = "0.0.1"
+authors = [
+  {name="Guanghan Wang", email="author@example.com"},
+  {name="Shaoheng Liang", email="author@example.com"},
+  {name="Jian Ma", email="author@example.com"},
+]
+description = ""
+readme = "readme.md"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "torch",
+    "tqdm",
+    "scanpy",
+    "squidpy",
+    "numpy",
+    "scipy",
+    "tensorboardX"
+]
+
+[project.urls]
+Homepage = "https://github.com/ma-compbio/SpaceFormer"
+Issues = "https://github.com/ma-compbio/SpaceFormer/issues"
+
+[tool.setuptools]
+py-modules = ["spaceformer"]

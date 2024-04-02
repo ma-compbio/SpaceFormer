@@ -10,7 +10,7 @@ from functools import partial
 from torch import optim as optim
 
 
-def get_logger(name, log_dir=None):
+def _get_logger(name, log_dir=None):
     logger = logging.getLogger(name)
     logger.setLevel(logging.DEBUG)
     formatter = logging.Formatter('[%(asctime)s::%(name)s::%(levelname)s] %(message)s')
@@ -30,7 +30,7 @@ def get_logger(name, log_dir=None):
 
 
 
-def sce_loss(x, y, alpha=3):
+def _sce_loss(x, y, alpha=3):
     x = F.normalize(x, p=2, dim=-1)
     y = F.normalize(y, p=2, dim=-1)
 
@@ -40,7 +40,7 @@ def sce_loss(x, y, alpha=3):
     return loss
 
 
-def create_loss(loss_fn, alpha_l=3):
+def _create_loss(loss_fn, alpha_l=3):
     if loss_fn == 'crossentropy':
         loss = nn.CrossEntropyLoss()
     elif loss_fn == 'sce':
@@ -50,7 +50,7 @@ def create_loss(loss_fn, alpha_l=3):
     return loss
 
 
-def create_optimizer(optim_type, model, lr, weight_decay):
+def _create_optimizer(optim_type, model, lr, weight_decay):
     parameters = model.parameters()
     opt_args = dict(lr=lr, weight_decay=weight_decay)
 
@@ -62,7 +62,11 @@ def create_optimizer(optim_type, model, lr, weight_decay):
     return optimizer
 
 
-def set_random_seed(seed):
+def set_random_seed(seed: int) -> None:
+    """Reset seed for Numpy and PyTorch
+
+    :param seed: Random seed
+    """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -71,7 +75,7 @@ def set_random_seed(seed):
     torch.backends.cudnn.determinstic = True
 
 
-def build_args():
+def _build_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--device", type=int, default=0)

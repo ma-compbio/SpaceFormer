@@ -7,14 +7,15 @@ from torch import optim
 from torch.utils.data import DataLoader
 from scipy.stats import pearsonr, spearmanr
 from .covet import covet_sqrt
-from .utils import sce_loss, get_logger
+from .utils import _sce_loss, _get_logger
 from tensorboardX import SummaryWriter
 from functools import partial
+from .dataset import _SpaceFormerDataset
 import os
 
-class MLPCelltype(nn.Module):
+class _MLPCelltype(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim):
-        super(MLPCelltype, self).__init__()
+        super(_MLPCelltype, self).__init__()
         self.fc1 = nn.Linear(input_dim, hidden_dim)
         self.activation = nn.ReLU()
         self.fc2 = nn.Linear(hidden_dim, output_dim)
@@ -26,9 +27,9 @@ class MLPCelltype(nn.Module):
         return x
     
 
-class MeanCelltype(nn.Module):
+class _MeanCelltype(nn.Module):
     def __init__(self, n_neighs, input_dim, hidden_dim, output_dim):
-        super(MeanCelltype, self).__init__()
+        super(_MeanCelltype, self).__init__()
         self.n_neighs = n_neighs
         self.fc1 = nn.Linear(input_dim + input_dim, hidden_dim)
         self.activation = nn.ReLU()
@@ -45,9 +46,9 @@ class MeanCelltype(nn.Module):
         return out
 
 
-class MeanAddCelltype(nn.Module):
+class _MeanAddCelltype(nn.Module):
     def __init__(self, n_neighs, input_dim, hidden_dim, output_dim):
-        super(MeanAddCelltype, self).__init__()
+        super(_MeanAddCelltype, self).__init__()
         self.n_neighs = n_neighs
         self.fc1 = nn.Linear(input_dim, hidden_dim)
         self.activation = nn.ReLU()
@@ -64,9 +65,9 @@ class MeanAddCelltype(nn.Module):
         return out
 
 
-class CovetCelltype(nn.Module):
+class _CovetCelltype(nn.Module):
     def __init__(self, n_neighs, input_dim, hidden_dim, output_dim):
-        super(CovetCelltype, self).__init__()
+        super(_CovetCelltype, self).__init__()
         self.n_neighs = n_neighs
         self.fc1 = nn.Linear(input_dim + 32 * 32, hidden_dim)
         self.activation = nn.ReLU()
@@ -82,9 +83,9 @@ class CovetCelltype(nn.Module):
         return out
 
 
-class Attention(nn.Module):
+class _Attention(nn.Module):
     def __init__(self, d_model):
-        super(Attention, self).__init__()
+        super(_Attention, self).__init__()
         self.d_model = d_model
 
         self.Q = nn.Linear(d_model, d_model, bias=False)
@@ -106,10 +107,10 @@ class Attention(nn.Module):
         return cntx, attn
 
 
-class GlobalTransformerCelltype(nn.Module):
+class _GlobalTransformerCelltype(nn.Module):
     def __init__(self, dropout, input_dim, ffn_dim, hidden_dim, output_dim):
-        super(GlobalTransformerCelltype, self).__init__()
-        self.encoder = Attention(input_dim)
+        super(_GlobalTransformerCelltype, self).__init__()
+        self.encoder = _Attention(input_dim)
         self.dropout1 = nn.Dropout(dropout)
         self.norm1 = nn.LayerNorm(input_dim)
 
@@ -122,7 +123,7 @@ class GlobalTransformerCelltype(nn.Module):
         )
         self.norm2 = nn.LayerNorm(input_dim)
 
-        self.decoder = Attention(input_dim)
+        self.decoder = _Attention(input_dim)
         self.dropout2 = nn.Dropout(dropout)
         self.norm3 = nn.LayerNorm(input_dim)
 
@@ -151,9 +152,9 @@ class GlobalTransformerCelltype(nn.Module):
         return h
 
 
-class LocalAttention(nn.Module):
+class _LocalAttention(nn.Module):
     def __init__(self, d_model):
-        super(LocalAttention, self).__init__()
+        super(_LocalAttention, self).__init__()
         self.d_model = d_model
 
         self.Q = nn.Linear(d_model, d_model, bias=False)
@@ -176,10 +177,10 @@ class LocalAttention(nn.Module):
         return cntx, attn
 
 
-class LocalTransformerCelltype(nn.Module):
+class _LocalTransformerCelltype(nn.Module):
     def __init__(self, dropout, input_dim, ffn_dim, hidden_dim, output_dim):
-        super(LocalTransformerCelltype, self).__init__()
-        self.encoder = LocalAttention(input_dim)
+        super(_LocalTransformerCelltype, self).__init__()
+        self.encoder = _LocalAttention(input_dim)
         self.dropout1 = nn.Dropout(dropout)
         self.norm1 = nn.LayerNorm(input_dim)
 
@@ -192,7 +193,7 @@ class LocalTransformerCelltype(nn.Module):
         )
         self.norm2 = nn.LayerNorm(input_dim)
 
-        self.decoder = LocalAttention(input_dim)
+        self.decoder = _LocalAttention(input_dim)
         self.dropout2 = nn.Dropout(dropout)
         self.norm3 = nn.LayerNorm(input_dim)
 
@@ -221,9 +222,9 @@ class LocalTransformerCelltype(nn.Module):
         return h
 
 
-class SpatialAttention(nn.Module):
+class _SpatialAttention(nn.Module):
     def __init__(self, d_model, gamma):
-        super(SpatialAttention, self).__init__()
+        super(_SpatialAttention, self).__init__()
         self.gamma = gamma
         self.d_model = d_model
 
@@ -261,75 +262,22 @@ class SpatialAttention(nn.Module):
         return cntx, attn
 
 
-class SpatialTransformerCelltype(nn.Module):
-    def __init__(self, dropout, input_dim, ffn_dim, hidden_dim, output_dim, gamma):
-        super(SpatialTransformerCelltype, self).__init__()
-        self.encoder = SpatialAttention(input_dim, gamma)
-        self.dropout1 = nn.Dropout(dropout)
-        self.norm1 = nn.LayerNorm(input_dim)
-
-        self.ff = nn.Sequential(
-            nn.Linear(input_dim, ffn_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(ffn_dim, input_dim),
-            nn.Dropout(dropout)
-        )
-        self.norm2 = nn.LayerNorm(input_dim)
-
-        self.decoder = SpatialAttention(input_dim, gamma)
-        self.dropout2 = nn.Dropout(dropout)
-        self.norm3 = nn.LayerNorm(input_dim)
-
-        self.head = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, output_dim)
-        )
-
-    def forward(self, x, real_edge_mask, fake_edge_mask):
-        hidden, encode_weights = self.encoder(x, real_edge_mask, fake_edge_mask)
-        hidden = self.dropout1(hidden)
-        hidden = hidden + x
-        hidden = self.norm1(hidden)
-
-        hidden = self.norm2(hidden + self.ff(hidden))
-
-        recon, decode_weights = self.decoder(hidden, real_edge_mask, fake_edge_mask)
-        recon = self.dropout2(recon)
-        recon = recon + hidden
-        recon = self.norm3(recon)
-
-        h = self.head(recon)
-
-        return h
-
-
-def build_model_celltype(args):
-    if args.model == 'MLP':
-        model = MLPCelltype(args.input_dim, args.hidden_dim, args.output_dim)
-    elif args.model == 'Mean':
-        model = MeanCelltype(args.n_neighs, args.input_dim, args.hidden_dim, args.output_dim)
-    elif args.model == 'MeanAdd':
-        model = MeanAddCelltype(args.n_neighs, args.input_dim, args.hidden_dim, args.output_dim)
-    elif args.model == 'Covet':
-        model = CovetCelltype(args.n_neighs, args.input_dim, args.hidden_dim, args.output_dim)
-    elif args.model == 'GlobalTransformer':
-        model = GlobalTransformerCelltype(args.dropout, args.input_dim, args.ffn_dim, args.hidden_dim, args.output_dim)
-    elif args.model == 'LocalTransformer':
-        model = LocalTransformerCelltype(args.dropout, args.input_dim, args.ffn_dim, args.hidden_dim, args.output_dim)
-    elif args.model == 'SpatialTransformer':
-        model = SpatialTransformerCelltype(args.dropout, args.input_dim, args.ffn_dim, args.hidden_dim, args.output_dim, args.gamma)
-    return model
-
-
 class SpaceFormer(nn.Module):
     def __init__(self, cell_mask_rate, gene_mask_rate, dropout, input_dim, ffn_dim, gamma):
+        """SpaceFormer Model
+
+        :param cell_mask_rate:
+        :param gene_mask_rate:
+        :param dropout:
+        :param input_dim:
+        :param ffn_dim:
+        :param gamma:
+        """
         super(SpaceFormer, self).__init__()
         self.cell_mask_rate = cell_mask_rate
         self.gene_mask_rate = gene_mask_rate
 
-        self.encoder = SpatialAttention(input_dim, gamma)
+        self.encoder = _SpatialAttention(input_dim, gamma)
         self.dropout1 = nn.Dropout(dropout)
         self.norm1 = nn.LayerNorm(input_dim)
 
@@ -342,7 +290,7 @@ class SpaceFormer(nn.Module):
         )
         self.norm2 = nn.LayerNorm(input_dim)
 
-        self.decoder = SpatialAttention(input_dim, gamma)
+        self.decoder = _SpatialAttention(input_dim, gamma)
         self.dropout2 = nn.Dropout(dropout)
         self.norm3 = nn.LayerNorm(input_dim)
 
@@ -402,58 +350,74 @@ class SpaceFormer(nn.Module):
 
         return x_init, x_recon, encode_weights, recon
 
-def train(model, dataset, device='cuda', optim_type='adam', lr=1e-4, weight_decay=0, warmup=8, max_epoch=200, loss_fn='sce', alpha=3, log_dir='log/'):
-    loader = DataLoader(dataset, batch_size=1, shuffle=True)
-    parameters = model.parameters()
-    opt_args = dict(lr=lr, weight_decay=weight_decay)
+    def transform():
+        raise NotImplemented("")
 
-    if optim_type == "adam":
-        optimizer = optim.Adam(parameters, **opt_args)
-    elif optim_type == 'SGD':
-        optimizer = optim.SGD(parameters, **opt_args)
+    def fit(self, dataset: _SpaceFormerDataset, device:str='cuda', optim_type:str='adam', lr:float=1e-4, weight_decay:float=0., 
+            warmup=8, max_epoch:int=200, loss_fn:str='sce', log_dir:str='log/'):
+        """Create a PyTorch Dataset from a list of adata
 
-    scheduler = lambda epoch :( 1 + np.cos((epoch - warmup) * np.pi / (max_epoch - warmup)) ) * 0.5 if epoch >= warmup else (epoch / warmup)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=scheduler)
-    
-    if loss_fn == 'crossentropy':
-        criterion = nn.CrossEntropyLoss()
-    elif loss_fn == 'sce':
-        criterion = partial(sce_loss, alpha=alpha)
-    elif loss_fn == "mse":
-        criterion = nn.MSELoss()    
+        :param dataset: Dataset to be trained on
+        :param device: Device to be used ("cpu" or "cuda")
+        :param optim_type: Optimizer for fitting
+        :param lr: Learning rate
+        :param weight_decay: Weight decay factor
+        :param warmup: Use higher training rate for earlier epochs
+        :param max_epoch: maximum number of epochs
+        :param loss_fn: Loss function for training
+        :param alpha: 
 
-    os.makedirs(log_dir, exist_ok=True)
-    logger = get_logger('train', log_dir)
-    writer = SummaryWriter(logdir=log_dir)
+        :return: A `torch.Dataset` including all data.
+        """
+        loader = DataLoader(dataset, batch_size=1, shuffle=True)
+        parameters = self.parameters()
+        opt_args = dict(lr=lr, weight_decay=weight_decay)
 
-    for epoch in range(max_epoch):
-        model.train()
-        train_loss = 0
-        for batch in loader:
-            inputs = batch[0].to(device).squeeze(0)
-            labels = batch[1].to(device).squeeze(0)
-            real_edge_mask = batch[2].to(device).squeeze(0)
-            fake_edge_mask = batch[3].to(device).squeeze(0)
-            x_init, x_recon, encode_weights, embedding = model(inputs, real_edge_mask, fake_edge_mask)
-            loss = criterion(x_init, x_recon)
-            train_loss += loss.item()
+        if optim_type == "adam":
+            optimizer = optim.Adam(parameters, **opt_args)
+        elif optim_type == 'SGD':
+            optimizer = optim.SGD(parameters, **opt_args)
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+        scheduler = lambda epoch :( 1 + np.cos((epoch - warmup) * np.pi / (max_epoch - warmup)) ) * 0.5 if epoch >= warmup else (epoch / warmup)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=scheduler)
+        
+        if loss_fn == 'crossentropy':
+            criterion = nn.CrossEntropyLoss()
+        elif loss_fn == 'sce':
+            criterion = partial(_sce_loss, alpha=3)
+        elif loss_fn == "mse":
+            criterion = nn.MSELoss()    
 
-        logger.info(f"Epoch {epoch + 1}: train_loss {train_loss / len(loader)}")
-        writer.add_scalar('Train_Loss', train_loss / len(loader), epoch)
-        writer.add_scalar('Learning_Rate', optimizer.state_dict()["param_groups"][0]["lr"], epoch)
-        scheduler.step()
+        os.makedirs(log_dir, exist_ok=True)
+        logger = _get_logger('train', log_dir)
+        writer = SummaryWriter(logdir=log_dir)
 
-class GlobalTransformerPretrain(nn.Module):
-    def __init__(self, cell_mask_rate, gene_mask_rate, dropout, input_dim, ffn_dim):
-        super(GlobalTransformerPretrain, self).__init__()
-        self.cell_mask_rate = cell_mask_rate
-        self.gene_mask_rate = gene_mask_rate
+        for epoch in range(max_epoch):
+            self.train()
+            train_loss = 0
+            for batch in loader:
+                inputs = batch[0].to(device).squeeze(0)
+                labels = batch[1].to(device).squeeze(0)
+                real_edge_mask = batch[2].to(device).squeeze(0)
+                fake_edge_mask = batch[3].to(device).squeeze(0)
+                x_init, x_recon, encode_weights, embedding = self(inputs, real_edge_mask, fake_edge_mask)
+                loss = criterion(x_init, x_recon)
+                train_loss += loss.item()
 
-        self.encoder = Attention(input_dim)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+            logger.info(f"Epoch {epoch + 1}: train_loss {train_loss / len(loader)}")
+            writer.add_scalar('Train_Loss', train_loss / len(loader), epoch)
+            writer.add_scalar('Learning_Rate', optimizer.state_dict()["param_groups"][0]["lr"], epoch)
+            scheduler.step()
+
+
+class _SpatialTransformerCelltype(nn.Module):
+    def __init__(self, dropout, input_dim, ffn_dim, hidden_dim, output_dim, gamma):
+        super(_SpatialTransformerCelltype, self).__init__()
+        self.encoder = _SpatialAttention(input_dim, gamma)
         self.dropout1 = nn.Dropout(dropout)
         self.norm1 = nn.LayerNorm(input_dim)
 
@@ -466,7 +430,72 @@ class GlobalTransformerPretrain(nn.Module):
         )
         self.norm2 = nn.LayerNorm(input_dim)
 
-        self.decoder = Attention(input_dim)
+        self.decoder = _SpatialAttention(input_dim, gamma)
+        self.dropout2 = nn.Dropout(dropout)
+        self.norm3 = nn.LayerNorm(input_dim)
+
+        self.head = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim)
+        )
+
+    def forward(self, x, real_edge_mask, fake_edge_mask):
+        hidden, encode_weights = self.encoder(x, real_edge_mask, fake_edge_mask)
+        hidden = self.dropout1(hidden)
+        hidden = hidden + x
+        hidden = self.norm1(hidden)
+
+        hidden = self.norm2(hidden + self.ff(hidden))
+
+        recon, decode_weights = self.decoder(hidden, real_edge_mask, fake_edge_mask)
+        recon = self.dropout2(recon)
+        recon = recon + hidden
+        recon = self.norm3(recon)
+
+        h = self.head(recon)
+
+        return h
+
+
+def _build_model_celltype(args):
+    if args.model == 'MLP':
+        model = _MLPCelltype(args.input_dim, args.hidden_dim, args.output_dim)
+    elif args.model == 'Mean':
+        model = _MeanCelltype(args.n_neighs, args.input_dim, args.hidden_dim, args.output_dim)
+    elif args.model == 'MeanAdd':
+        model = _MeanAddCelltype(args.n_neighs, args.input_dim, args.hidden_dim, args.output_dim)
+    elif args.model == 'Covet':
+        model = _CovetCelltype(args.n_neighs, args.input_dim, args.hidden_dim, args.output_dim)
+    elif args.model == 'GlobalTransformer':
+        model = _GlobalTransformerCelltype(args.dropout, args.input_dim, args.ffn_dim, args.hidden_dim, args.output_dim)
+    elif args.model == 'LocalTransformer':
+        model = _LocalTransformerCelltype(args.dropout, args.input_dim, args.ffn_dim, args.hidden_dim, args.output_dim)
+    elif args.model == 'SpatialTransformer':
+        model = _SpatialTransformerCelltype(args.dropout, args.input_dim, args.ffn_dim, args.hidden_dim, args.output_dim, args.gamma)
+    return model
+
+
+class _GlobalTransformerPretrain(nn.Module):
+    def __init__(self, cell_mask_rate, gene_mask_rate, dropout, input_dim, ffn_dim):
+        super(_GlobalTransformerPretrain, self).__init__()
+        self.cell_mask_rate = cell_mask_rate
+        self.gene_mask_rate = gene_mask_rate
+
+        self.encoder = _Attention(input_dim)
+        self.dropout1 = nn.Dropout(dropout)
+        self.norm1 = nn.LayerNorm(input_dim)
+
+        self.ff = nn.Sequential(
+            nn.Linear(input_dim, ffn_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(ffn_dim, input_dim),
+            nn.Dropout(dropout)
+        )
+        self.norm2 = nn.LayerNorm(input_dim)
+
+        self.decoder = _Attention(input_dim)
         self.dropout2 = nn.Dropout(dropout)
         self.norm3 = nn.LayerNorm(input_dim)
         
@@ -527,13 +556,13 @@ class GlobalTransformerPretrain(nn.Module):
         return x_init, x_recon, encode_weights, recon
     
 
-class LocalTransformerPretrain(nn.Module):
+class _LocalTransformerPretrain(nn.Module):
     def __init__(self, cell_mask_rate, gene_mask_rate, dropout, input_dim, ffn_dim):
-        super(LocalTransformerPretrain, self).__init__()
+        super(_LocalTransformerPretrain, self).__init__()
         self.cell_mask_rate = cell_mask_rate
         self.gene_mask_rate = gene_mask_rate
 
-        self.encoder = LocalAttention(input_dim)
+        self.encoder = _LocalAttention(input_dim)
         self.dropout1 = nn.Dropout(dropout)
         self.norm1 = nn.LayerNorm(input_dim)
 
@@ -607,13 +636,15 @@ class LocalTransformerPretrain(nn.Module):
         return x_init, x_recon, encode_weights, recon
 
 
-class SpatialTransformerPretrain(nn.Module):
+class _SpatialTransformerPretrain(nn.Module):
     def __init__(self, cell_mask_rate, gene_mask_rate, dropout, input_dim, ffn_dim, gamma):
-        super(SpatialTransformerPretrain, self).__init__()
+        """
+        """
+        super(_SpatialTransformerPretrain, self).__init__()
         self.cell_mask_rate = cell_mask_rate
         self.gene_mask_rate = gene_mask_rate
 
-        self.encoder = SpatialAttention(input_dim, gamma)
+        self.encoder = _SpatialAttention(input_dim, gamma)
         self.dropout1 = nn.Dropout(dropout)
         self.norm1 = nn.LayerNorm(input_dim)
 
@@ -626,7 +657,7 @@ class SpatialTransformerPretrain(nn.Module):
         )
         self.norm2 = nn.LayerNorm(input_dim)
 
-        self.decoder = SpatialAttention(input_dim, gamma)
+        self.decoder = _SpatialAttention(input_dim, gamma)
         self.dropout2 = nn.Dropout(dropout)
         self.norm3 = nn.LayerNorm(input_dim)
 
@@ -687,19 +718,19 @@ class SpatialTransformerPretrain(nn.Module):
         return x_init, x_recon, encode_weights, recon
 
 
-def build_model_pretrain(args):
+def _build_model_pretrain(args):
     if args.model == 'GlobalTransformer':
-        model = GlobalTransformerPretrain(args.cell_mask_rate, args.gene_mask_rate, args.dropout, args.input_dim, args.ffn_dim)
+        model = _GlobalTransformerPretrain(args.cell_mask_rate, args.gene_mask_rate, args.dropout, args.input_dim, args.ffn_dim)
     elif args.model == 'LocalTransformer':
-        model = LocalTransformerPretrain(args.cell_mask_rate, args.gene_mask_rate, args.dropout, args.input_dim, args.ffn_dim)
+        model = _LocalTransformerPretrain(args.cell_mask_rate, args.gene_mask_rate, args.dropout, args.input_dim, args.ffn_dim)
     elif args.model == 'SpatialTransformer':
-        model = SpatialTransformerPretrain(args.cell_mask_rate, args.gene_mask_rate, args.dropout, args.input_dim, args.ffn_dim, args.gamma)
+        model = _SpatialTransformerPretrain(args.cell_mask_rate, args.gene_mask_rate, args.dropout, args.input_dim, args.ffn_dim, args.gamma)
     return model
 
 
-class MLPImputation(nn.Module):
+class _MLPImputation(nn.Module):
     def __init__(self, input_dim, hidden_dim, imputation_rate):
-        super(MLPImputation, self).__init__()
+        super(_MLPImputation, self).__init__()
         self.imputation_rate = imputation_rate
 
         self.mlp = nn.Sequential(
@@ -763,9 +794,9 @@ class MLPImputation(nn.Module):
         return pearson_list, spearman_list
     
 
-class MeanImputation(nn.Module):
+class _MeanImputation(nn.Module):
     def __init__(self, n_neighs, input_dim, hidden_dim, imputation_rate):
-        super(MeanImputation, self).__init__()
+        super(_MeanImputation, self).__init__()
         self.n_neighs = n_neighs
         self.imputation_rate = imputation_rate
 
@@ -840,9 +871,9 @@ class MeanImputation(nn.Module):
         return pearson_list, spearman_list
     
 
-class CovetImputation(nn.Module):
+class _CovetImputation(nn.Module):
     def __init__(self, n_neighs, input_dim, hidden_dim, imputation_rate):
-        super(CovetImputation, self).__init__()
+        super(_CovetImputation, self).__init__()
         self.imputation_rate = imputation_rate
         self.n_neighs = n_neighs
 
@@ -915,9 +946,9 @@ class CovetImputation(nn.Module):
         return pearson_list, spearman_list
 
 
-class GlobalTransformerImputation(nn.Module):
+class _GlobalTransformerImputation(nn.Module):
     def __init__(self, input_dim, ffn_dim, dropout, imputation_rate):
-        super(GlobalTransformerImputation, self).__init__()
+        super(_GlobalTransformerImputation, self).__init__()
 
         self.imputation_rate = imputation_rate
 
@@ -934,7 +965,7 @@ class GlobalTransformerImputation(nn.Module):
         )
         self.norm2 = nn.LayerNorm(input_dim)
 
-        self.decoder = Attention(input_dim)
+        self.decoder = _Attention(input_dim)
         self.dropout2 = nn.Dropout(dropout)
         self.norm3 = nn.LayerNorm(input_dim)
 
@@ -1020,13 +1051,13 @@ class GlobalTransformerImputation(nn.Module):
         return pearson_list, spearman_list
     
 
-class LocalTransformerImputation(nn.Module):
+class _LocalTransformerImputation(nn.Module):
     def __init__(self, input_dim, ffn_dim, dropout, imputation_rate):
-        super(LocalTransformerImputation, self).__init__()
+        super(_LocalTransformerImputation, self).__init__()
 
         self.imputation_rate = imputation_rate
 
-        self.encoder = LocalAttention(input_dim)
+        self.encoder = _LocalAttention(input_dim)
         self.dropout1 = nn.Dropout(dropout)
         self.norm1 = nn.LayerNorm(input_dim)
 
@@ -1039,7 +1070,7 @@ class LocalTransformerImputation(nn.Module):
         )
         self.norm2 = nn.LayerNorm(input_dim)
 
-        self.decoder = LocalAttention(input_dim)
+        self.decoder = _LocalAttention(input_dim)
         self.dropout2 = nn.Dropout(dropout)
         self.norm3 = nn.LayerNorm(input_dim)
 
@@ -1124,13 +1155,13 @@ class LocalTransformerImputation(nn.Module):
         return pearson_list, spearman_list
 
 
-class SpatialTransformerImputation(nn.Module):
+class _SpatialTransformerImputation(nn.Module):
     def __init__(self, input_dim, ffn_dim, dropout, imputation_rate, gamma):
-        super(SpatialTransformerImputation, self).__init__()
+        super(_SpatialTransformerImputation, self).__init__()
 
         self.imputation_rate = imputation_rate
 
-        self.encoder = SpatialAttention(input_dim, gamma)
+        self.encoder = _SpatialAttention(input_dim, gamma)
         self.dropout1 = nn.Dropout(dropout)
         self.norm1 = nn.LayerNorm(input_dim)
 
@@ -1143,7 +1174,7 @@ class SpatialTransformerImputation(nn.Module):
         )
         self.norm2 = nn.LayerNorm(input_dim)
 
-        self.decoder = SpatialAttention(input_dim, gamma)
+        self.decoder = _SpatialAttention(input_dim, gamma)
         self.dropout2 = nn.Dropout(dropout)
         self.norm3 = nn.LayerNorm(input_dim)
 
@@ -1228,17 +1259,17 @@ class SpatialTransformerImputation(nn.Module):
         return pearson_list, spearman_list
 
 
-def build_model_imputation(args):
+def _build_model_imputation(args):
     if args.model == 'MLP':
-        model = MLPImputation(args.input_dim, args.hidden_dim, args.imputation_rate)
+        model = _MLPImputation(args.input_dim, args.hidden_dim, args.imputation_rate)
     elif args.model == 'Mean':
-        model = MeanImputation(args.n_neighs, args.input_dim, args.hidden_dim, args.imputation_rate)
+        model = _MeanImputation(args.n_neighs, args.input_dim, args.hidden_dim, args.imputation_rate)
     elif args.model == 'Covet':
-        model = CovetImputation(args.n_neighs, args.input_dim, args.hidden_dim, args.imputation_rate)
+        model = _CovetImputation(args.n_neighs, args.input_dim, args.hidden_dim, args.imputation_rate)
     elif args.model == 'GlobalTransformer':
-        model = GlobalTransformerImputation(args.input_dim, args.ffn_dim, args.dropout, args.imputation_rate)
+        model = _GlobalTransformerImputation(args.input_dim, args.ffn_dim, args.dropout, args.imputation_rate)
     elif args.model == 'LocalTransformer':
-        model = LocalTransformerImputation(args.input_dim, args.ffn_dim, args.dropout, args.imputation_rate)
+        model = _LocalTransformerImputation(args.input_dim, args.ffn_dim, args.dropout, args.imputation_rate)
     elif args.model == 'SpatialTransformer':
-        model = SpatialTransformerImputation(args.input_dim, args.ffn_dim, args.dropout, args.imputation_rate, args.gamma)
+        model = _SpatialTransformerImputation(args.input_dim, args.ffn_dim, args.dropout, args.imputation_rate, args.gamma)
     return model

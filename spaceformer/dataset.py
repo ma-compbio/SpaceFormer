@@ -6,8 +6,9 @@ import scanpy as sc
 from tqdm import tqdm
 import scipy as sp
 
-class SpaceFormerDataset(Dataset):
+class _SpaceFormerDataset(Dataset):
     def __init__(self, data_list, spatial):
+        super(_SpaceFormerDataset, self).__init__()
         self.data = data_list
         self.spatial = spatial
 
@@ -29,7 +30,16 @@ class SpaceFormerDataset(Dataset):
             return X, labels, raw_X
 
 
-def make_dataset(adatas, label, n_neighs=8, use_hvg=True):
+def make_dataset(adatas: list[sc.AnnData], label: str, n_neighs: int = 8, use_hvg: bool = True) -> Dataset:
+    """Create a PyTorch Dataset from a list of adata
+
+    :param adatas: A list of `SCANPY AnnData` objects
+    :param label: Name for the column storing cell labels (e.g., cell types or clusters), in `adata.obs`
+    :param n_neighs: Number of neighbors in the spatial graph
+    :param use_hvg: use HVG in `adata.var`. If `false`, use all features.
+
+    :return: A `torch.Dataset` including all data.
+    """
     all_labels = set()
     for i in range(len(adatas)):
         adata = adatas[i]
@@ -82,10 +92,10 @@ def make_dataset(adatas, label, n_neighs=8, use_hvg=True):
         
         datasets.append(data_dict)
         
-    return SpaceFormerDataset(datasets, True), LABEL_DICT
+    return _SpaceFormerDataset(datasets, True), LABEL_DICT
 
 
-class BrainDataset(Dataset):
+class _BrainDataset(Dataset):
     def __init__(self, data_list, spatial):
         self.data = data_list
         self.spatial = spatial
