@@ -266,12 +266,12 @@ class SpaceFormer(nn.Module):
     def __init__(self, cell_mask_rate, gene_mask_rate, dropout, input_dim, ffn_dim, gamma):
         """SpaceFormer Model
 
-        :param cell_mask_rate:
-        :param gene_mask_rate:
-        :param dropout:
-        :param input_dim:
-        :param ffn_dim:
-        :param gamma:
+        :param cell_mask_rate: Probablity of masking a cell in training
+        :param gene_mask_rate: Probablity of masking a feature (gene) in training
+        :param dropout: Dropout rate duing training
+        :param input_dim: Input dimension (number of genes)
+        :param ffn_dim: Dimension of hidden layer
+        :param gamma: Contrast of global / local attention.
         """
         super(SpaceFormer, self).__init__()
         self.cell_mask_rate = cell_mask_rate
@@ -365,7 +365,7 @@ class SpaceFormer(nn.Module):
         :param warmup: Use higher training rate for earlier epochs
         :param max_epoch: maximum number of epochs
         :param loss_fn: Loss function for training
-        :param alpha: 
+        :param log_dir: Directory to save logs
 
         :return: A `torch.Dataset` including all data.
         """
