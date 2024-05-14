@@ -353,6 +353,39 @@ class SpaceFormer(nn.Module):
     def transform():
         raise NotImplemented("")
 
+    def get_gene_attn(self, separate_q_k:bool=False):
+        """Get gene attention matrix
+        
+        :param separate_q_k: If True, return Q and K. Otherwise, return Q.T @ K.
+
+        :return: Gene attention matrix
+        """
+        q = self.encoder.Q_real.weight.detach().cpu()
+        k = self.encoder.K_real.weight.detach().cpu()
+        if separate_q_k:
+            return q, k
+        else:
+            return q.T @ k
+
+    def get_attn_and_embedding(self, dataset: _SpaceFormerDataset):
+        """Get attention weights and embeddings
+        
+        :param separate_q_k: If True, return Q and K. Otherwise, return Q.T @ K.
+
+        :return: Gene attention matrix
+        """
+        encode_weights = []
+        embeddings = []
+        loader = DataLoader(dataset, batch_size=1, shuffle=False)
+        for batch in loader:
+            inputs = batch[0].to(device).squeeze(0)
+            real_edge_mask = batch[2].to(device).squeeze(0)
+            fake_edge_mask = batch[3].to(device).squeeze(0)
+            _, _, encode_weight, embedding = self(inputs, real_edge_mask, fake_edge_mask, )
+            encode_weights.append(encode_weight)
+            embeddings.append(embedding)
+        return encode_weights, embeddings
+
     def fit(self, dataset: _SpaceFormerDataset, device:str='cuda', optim_type:str='adam', lr:float=1e-4, weight_decay:float=0., 
             warmup=8, max_epoch:int=200, loss_fn:str='sce', log_dir:str='log/'):
         """Create a PyTorch Dataset from a list of adata
