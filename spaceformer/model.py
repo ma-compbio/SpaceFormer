@@ -1,393 +1,208 @@
 import torch
-import math
 import numpy as np
-import scanpy as sc
-import torch.nn as nn
+from torch import nn
 from torch import optim
 from torch.utils.data import DataLoader
-from scipy.stats import pearsonr, spearmanr
-from .covet import covet_sqrt
 from .utils import _sce_loss, _get_logger
 from tensorboardX import SummaryWriter
 from functools import partial
 from .dataset import _SpaceFormerDataset
 import os
-
-class _MLPCelltype(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim):
-        super(_MLPCelltype, self).__init__()
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.activation = nn.ReLU()
-        self.fc2 = nn.Linear(hidden_dim, output_dim)
-
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.activation(x)
-        x = self.fc2(x)
-        return x
-    
-
-class _MeanCelltype(nn.Module):
-    def __init__(self, n_neighs, input_dim, hidden_dim, output_dim):
-        super(_MeanCelltype, self).__init__()
-        self.n_neighs = n_neighs
-        self.fc1 = nn.Linear(input_dim + input_dim, hidden_dim)
-        self.activation = nn.ReLU()
-        self.fc2 = nn.Linear(hidden_dim, output_dim)
-
-    def forward(self, x, real_edge_mask, fake_edge_mask):
-        node_indices = torch.nonzero(fake_edge_mask > 0)[:, 1]
-        niche_feat = x[node_indices].reshape(x.shape[0], self.n_neighs, -1)
-        res = torch.sum(niche_feat, dim=1) / self.n_neighs
-        hidden = torch.cat((x, res), dim=1)
-        out = self.fc1(hidden)
-        out = self.activation(out)
-        out = self.fc2(out)
-        return out
+from typing import Literal
 
 
-class _MeanAddCelltype(nn.Module):
-    def __init__(self, n_neighs, input_dim, hidden_dim, output_dim):
-        super(_MeanAddCelltype, self).__init__()
-        self.n_neighs = n_neighs
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.activation = nn.ReLU()
-        self.fc2 = nn.Linear(hidden_dim, output_dim)
+class NonNegLinear(nn.Module):
+    def __init__(self, d_in, d_out, bias) -> None:
+        super().__init__()
+        self._weight = torch.nn.Parameter(torch.randn(d_out, d_in) - 3)
+        self.elu = nn.ELU()
+        if bias:
+            raise NotImplementedError()
 
-    def forward(self, x, real_edge_mask, fake_edge_mask):
-        node_indices = torch.nonzero(fake_edge_mask > 0)[:, 1]
-        niche_feat = x[node_indices].reshape(x.shape[0], self.n_neighs, -1)
-        res = torch.sum(niche_feat, dim=1) / self.n_neighs
-        hidden = x + res
-        out = self.fc1(hidden)
-        out = self.activation(out)
-        out = self.fc2(out)
-        return out
-
-
-class _CovetCelltype(nn.Module):
-    def __init__(self, n_neighs, input_dim, hidden_dim, output_dim):
-        super(_CovetCelltype, self).__init__()
-        self.n_neighs = n_neighs
-        self.fc1 = nn.Linear(input_dim + 32 * 32, hidden_dim)
-        self.activation = nn.ReLU()
-        self.fc2 = nn.Linear(hidden_dim, output_dim)
-
-    def forward(self, x, coordinates, highly_variable_genes):
-        res = covet_sqrt(highly_variable_genes.cpu().numpy(), coordinates.cpu().numpy(), self.n_neighs)
-        res = torch.from_numpy(res.reshape(-1, 32 * 32)).to(x.device)
-        hidden = torch.cat((x, res), dim=1)
-        out = self.fc1(hidden)
-        out = self.activation(out)
-        out = self.fc2(out)
-        return out
-
-
-class _Attention(nn.Module):
-    def __init__(self, d_model):
-        super(_Attention, self).__init__()
-        self.d_model = d_model
-
-        self.Q = nn.Linear(d_model, d_model, bias=False)
-        self.K = nn.Linear(d_model, d_model, bias=False)
-        self.V = nn.Linear(d_model, d_model, bias=False)
+    @property
+    def weight(self):
+        return self.elu(self._weight) + 1
 
     def forward(self, x):
-        Q = self.Q(x)
-        K = self.K(x)
-        V = self.V(x)
+        return x @ self.weight.T
 
-        scores = torch.matmul(Q, K.transpose(0, 1)) / math.sqrt(self.d_model)
-        max_values, _ = torch.max(scores, dim=1, keepdim=True)
-        scores = torch.exp(scores - max_values)
+class NonNegLinear2(nn.Module):
+    def __init__(self, d_in, d_out, bias) -> None:
+        super().__init__()
+        self._weight = torch.nn.Parameter(torch.randn(d_out, d_in) - 3)
+        self.shift = torch.nn.Parameter(torch.randn(1))
+        self.elu = nn.ELU()
+        if bias:
+            raise NotImplementedError()
 
-        attn = scores / torch.sum(scores, dim=-1, keepdim=True)
-        cntx = torch.matmul(attn, V)
+    @property
+    def weight(self):
+        return self.elu(self._weight) + 1
     
-        return cntx, attn
-
-
-class _GlobalTransformerCelltype(nn.Module):
-    def __init__(self, dropout, input_dim, ffn_dim, hidden_dim, output_dim):
-        super(_GlobalTransformerCelltype, self).__init__()
-        self.encoder = _Attention(input_dim)
-        self.dropout1 = nn.Dropout(dropout)
-        self.norm1 = nn.LayerNorm(input_dim)
-
-        self.ff = nn.Sequential(
-            nn.Linear(input_dim, ffn_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(ffn_dim, input_dim),
-            nn.Dropout(dropout)
-        )
-        self.norm2 = nn.LayerNorm(input_dim)
-
-        self.decoder = _Attention(input_dim)
-        self.dropout2 = nn.Dropout(dropout)
-        self.norm3 = nn.LayerNorm(input_dim)
-
-        self.head = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, output_dim)
-        )
-
+    @property
+    def weight2(self):
+        return self.weight + self.shift
 
     def forward(self, x):
-        hidden, encode_weights = self.encoder(x)
-        hidden = self.dropout1(hidden)
-        hidden = hidden + x
-        hidden = self.norm1(hidden)
-
-        hidden = self.norm2(hidden + self.ff(hidden))
-
-        recon, decode_weights = self.decoder(hidden)
-        recon = self.dropout2(recon)
-        recon = recon + hidden
-        recon = self.norm3(recon)
-
-        h = self.head(recon)
-
-        return h
-
-
-class _LocalAttention(nn.Module):
-    def __init__(self, d_model):
-        super(_LocalAttention, self).__init__()
-        self.d_model = d_model
-
-        self.Q = nn.Linear(d_model, d_model, bias=False)
-        self.K = nn.Linear(d_model, d_model, bias=False)
-        self.V = nn.Linear(d_model, d_model, bias=False)
-
-    def forward(self, x, mask):
-        Q = self.Q(x)
-        K = self.K(x)
-        V = self.V(x)
-
-        scores = torch.matmul(Q, K.transpose(0, 1)) / math.sqrt(self.d_model)
-        scores.masked_fill_(mask, -1e9)
-        max_values, _ = torch.max(scores, dim=1, keepdim=True)
-        scores = torch.exp(scores - max_values)
-
-        attn = scores / torch.sum(scores, dim=-1, keepdim=True)
-        cntx = torch.matmul(attn, V)
+        return x @ self.weight.T
     
-        return cntx, attn
+    def rofward(self, x):
+        return x @ self.weight2
+
+class NonNegBias(nn.Module):
+    def __init__(self, d) -> None:
+        super().__init__()
+        self._bias = torch.nn.Parameter(torch.zeros(1, d))
+        self.elu = nn.ELU()
+
+    @property
+    def bias(self):
+        return self.elu(self._bias) + 1
+
+    def forward(self, x):
+        return x + self.bias
 
 
-class _LocalTransformerCelltype(nn.Module):
-    def __init__(self, dropout, input_dim, ffn_dim, hidden_dim, output_dim):
-        super(_LocalTransformerCelltype, self).__init__()
-        self.encoder = _LocalAttention(input_dim)
-        self.dropout1 = nn.Dropout(dropout)
-        self.norm1 = nn.LayerNorm(input_dim)
+class BilinearAttention(nn.Module):
+    def __init__(self, d_in, d_ego, d_local, d_global, d_out=None):
+        super(BilinearAttention, self).__init__()
+        if d_out is None:
+            d_out = d_in
+        self.d_in = d_in
+        self.d_ego = d_ego
+        self.d_local = d_local
+        self.d_global = d_global
 
-        self.ff = nn.Sequential(
-            nn.Linear(input_dim, ffn_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(ffn_dim, input_dim),
-            nn.Dropout(dropout)
-        )
-        self.norm2 = nn.LayerNorm(input_dim)
+        self.bias = NonNegBias(d_out)
 
-        self.decoder = _LocalAttention(input_dim)
-        self.dropout2 = nn.Dropout(dropout)
-        self.norm3 = nn.LayerNorm(input_dim)
+        # self.qk_ego = nn.Linear(d_in, d_ego, bias=False)
+        self.v_ego = NonNegLinear2(d_ego, d_out, bias=False)
 
-        self.head = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, output_dim)
-        )
+        self.q_local = nn.Linear(d_in, d_local, bias=False)
+        self.k_local = NonNegLinear(d_in, d_local, bias=False)
+        self.v_local = NonNegLinear(d_local, d_out, bias=False)
 
+        if self.d_global > 0:
+            self.q_global = nn.Linear(d_in, d_global, bias=False)
+            self.k_global = NonNegLinear(d_in, d_global, bias=False)
+            self.v_global = NonNegLinear(d_global, d_out, bias=False)
+        else:
+            self.q_global = None
+            self.k_global = None
+            self.v_global = None
 
-    def forward(self, x, real_edge_mask, fake_edge_mask):
-        hidden, encode_weights = self.encoder(x, real_edge_mask)
-        hidden = self.dropout1(hidden)
-        hidden = hidden + x
-        hidden = self.norm1(hidden)
+    def forward(self, adj_matrix, x, masked_x=None, x_bar=None, superego=False):
+        if x_bar is None:
+            x_bar = torch.mean(x, axis=0, keepdim=True) # in which case, m := 1
+            # Note: x_bar can have multiple pseudobulks.
 
-        hidden = self.norm2(hidden + self.ff(hidden))
+        if masked_x is None:
+            masked_x = x
 
-        recon, decode_weights = self.decoder(hidden, real_edge_mask)
-        recon = self.dropout2(recon)
-        recon = recon + hidden
-        recon = self.norm3(recon)
+        # ego_scores = self.qk_ego(masked_x) / x.shape[1] 
+        ego_scores = self.v_ego.rofward(masked_x) / x.shape[1] 
+        if superego:
+            max_ego_score, _ = torch.max(ego_scores, dim=1, keepdim=True)
+            ego_scores = torch.exp(ego_scores - max_ego_score)
+            ego_attn = ego_scores / torch.sum(ego_scores, dim=-1, keepdim=True)
+            return torch.exp(self.v_ego(ego_attn)), None, None
+        
+        q_local = self.q_local(masked_x) # n * g -> n * d
+        k_local = self.k_local(x) # n * g -> n * d
+        # (d * n * 1) x (d * 1 * n) -> d * n * n
+        local_scores = q_local.transpose(-1, -2)[:, :, None] * k_local.transpose(-1, -2)[:, None, :] / x.shape[1] / x.shape[1]
+        local_scores.masked_fill_(~adj_matrix, -1e9)
+        local_scores = local_scores.transpose(-2, -3) # n * d * n
 
-        h = self.head(recon)
+        max_local_score, _ = torch.max(local_scores.reshape((local_scores.shape[0], -1)), dim=1, keepdim=True)
+        max_ego_score, _ = torch.max(ego_scores, dim=1, keepdim=True)
 
-        return h
+        if self.d_global > 0:
+            q_global = self.q_global(masked_x) # n * g -> n * d
+            k_global = self.k_global(x_bar)    # m * g -> m * d
+            global_scores = q_global.transpose(-1, -2)[:, :, None] * k_global.transpose(-1, -2)[:, None, :] / x.shape[1] / x.shape[1]
+            global_scores = global_scores.transpose(-2, -3) # n * d * m
+            max_score, _ = torch.max(torch.cat([global_scores.reshape((global_scores.shape[0], -1)), 
+                                                max_ego_score, 
+                                                max_local_score], dim=1), dim=1, keepdim=True)
+        else:
+            max_score, _ = torch.max(torch.cat([max_ego_score, max_local_score], dim=1), dim=1, keepdim=True)
 
+        ego_scores = torch.exp(ego_scores - max_score)
+        local_scores = torch.exp(local_scores - max_score[:, :, None])
+        local_scores = torch.sum(local_scores, dim=-1)
 
-class _SpatialAttention(nn.Module):
-    def __init__(self, d_model, gamma):
-        super(_SpatialAttention, self).__init__()
-        self.gamma = gamma
-        self.d_model = d_model
+        if self.d_global > 0:
+            global_scores = torch.exp(global_scores - max_score[:, :, None])
+            global_scores = torch.sum(global_scores, dim=-1)
+            sum_score = (torch.sum(ego_scores, dim=-1, keepdim=True) + 
+                        torch.sum(local_scores, dim=-1, keepdim=True) + 
+                        torch.sum(global_scores, dim=-1, keepdim=True))
+            global_attn = global_scores / sum_score
+            global_res = self.v_global(global_attn)
+        else:
+            sum_score = (torch.sum(ego_scores, dim=-1, keepdim=True) + 
+                        torch.sum(local_scores, dim=-1, keepdim=True))
 
-        self.Q_real = nn.Linear(d_model, d_model, bias=False)
-        self.Q_fake = nn.Linear(d_model, d_model, bias=False)
-        self.K_real = nn.Linear(d_model, d_model, bias=False)
-        self.K_fake = nn.Linear(d_model, d_model, bias=False)
-        self.V = nn.Linear(d_model, d_model, bias=False)
+        ego_attn = ego_scores / sum_score
+        local_attn = local_scores / sum_score
 
-    def forward(self, x, real_edge_mask, fake_edge_mask):
-        Q_real = self.Q_real(x)
-        K_real = self.K_real(x)
-        Q_fake = self.Q_fake(x)
-        K_fake = self.K_fake(x)
-        V = self.V(x)
+        ego_res = self.v_ego(ego_attn)
+        local_res = self.v_local(local_attn)
+        
+        if self.d_global > 0:
+            res = ego_res + local_res + global_res
+        else:
+            res = ego_res + local_res
+            global_res = None
+            global_attn = None
 
-        real_scores = torch.matmul(Q_real, K_real.transpose(0, 1)) / math.sqrt(self.d_model)
-        real_scores.masked_fill_(real_edge_mask, -1e9)
-        real_scores_max, _ = torch.max(real_scores, dim=1, keepdim=True)
-        fake_scores = torch.matmul(Q_fake, K_fake.transpose(0, 1)) / math.sqrt(self.d_model)
-        fake_scores.masked_fill_(fake_edge_mask, -1e9)
-        fake_scores_max, _ = torch.max(fake_scores, dim=1, keepdim=True)
-        max_scores = torch.maximum(real_scores_max, fake_scores_max)
+        res = self.bias(res)
+        return res, (ego_res, local_res, global_res), (ego_attn, local_attn, global_attn)
 
-        real_scores = real_scores - max_scores
-        real_scores = torch.exp(real_scores) / (1 + self.gamma)
-        fake_scores = fake_scores - max_scores
-        fake_scores = self.gamma * torch.exp(fake_scores) / (1 + self.gamma)
-
-        scores = real_scores + fake_scores
-
-        attn = scores / torch.sum(scores, dim=-1, keepdim=True)
-        cntx = torch.matmul(attn, V)
     
-        return cntx, attn
-
-
 class SpaceFormer(nn.Module):
-    def __init__(self, cell_mask_rate, gene_mask_rate, dropout, input_dim, ffn_dim, gamma):
-        """SpaceFormer Model
+    def __init__(self, features: list[str] | int, d_ego, d_local, d_global):
+        """SpaceFormer2 Model 
 
-        :param cell_mask_rate: Probablity of masking a cell in training
-        :param gene_mask_rate: Probablity of masking a feature (gene) in training
-        :param dropout: Dropout rate duing training
-        :param input_dim: Input dimension (number of genes)
-        :param ffn_dim: Dimension of hidden layer
-        :param gamma: Contrast of global / local attention.
+        :param features: input feature (gene) names or the number of features
+        :param local_d: 
+        :param global_d: 
         """
         super(SpaceFormer, self).__init__()
-        self.cell_mask_rate = cell_mask_rate
-        self.gene_mask_rate = gene_mask_rate
 
-        self.encoder = _SpatialAttention(input_dim, gamma)
-        self.dropout1 = nn.Dropout(dropout)
-        self.norm1 = nn.LayerNorm(input_dim)
-
-        self.ff = nn.Sequential(
-            nn.Linear(input_dim, ffn_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(ffn_dim, input_dim),
-            nn.Dropout(dropout)
-        )
-        self.norm2 = nn.LayerNorm(input_dim)
-
-        self.decoder = _SpatialAttention(input_dim, gamma)
-        self.dropout2 = nn.Dropout(dropout)
-        self.norm3 = nn.LayerNorm(input_dim)
-
-        self.ff1 = nn.Sequential(
-            nn.Linear(input_dim, ffn_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(ffn_dim, input_dim),
-            nn.Dropout(dropout)
-        )
-        self.norm4 = nn.LayerNorm(input_dim)
-
-        self.head = nn.Linear(input_dim, input_dim)
-
-    def encoding_mask_nodes(self, x, cell_mask_rate, gene_mask_rate):
-        num_nodes = x.shape[0]
-        perm = torch.randperm(num_nodes, device=x.device)
-        num_mask_nodes = int(cell_mask_rate * num_nodes)
-        mask_nodes = perm[: num_mask_nodes]
-
-        mask_x = x[mask_nodes].clone()
-        gene_mask = torch.zeros_like(mask_x, dtype=torch.bool).to(x.device)
-        for i in range(mask_x.size(0)):
-            num_to_zero =  int(gene_mask_rate * mask_x.size(1))
-            indices_to_zero = torch.randperm(mask_x.size(1))[:num_to_zero]
-            mask_x[i, indices_to_zero] = 0
-            gene_mask[i, indices_to_zero] = True
-        
-        out_x = x.clone()
-        out_x[mask_nodes] = mask_x
-
-        return out_x, mask_nodes, gene_mask
-
-    def forward(self, x, real_edge_mask, fake_edge_mask):
-        use_x, mask_nodes, gene_mask = self.encoding_mask_nodes(x, self.cell_mask_rate, self.gene_mask_rate)
-
-        hidden, encode_weights = self.encoder(use_x, real_edge_mask, fake_edge_mask)
-        hidden = self.dropout1(hidden)
-        hidden = hidden + use_x
-        hidden = self.norm1(hidden)
-
-        hidden = self.norm2(hidden + self.ff(hidden))
-
-        hidden[mask_nodes][gene_mask] = 0
-
-        recon, decode_weights = self.decoder(hidden, real_edge_mask, fake_edge_mask)
-        recon = self.dropout2(recon)
-        recon = recon + hidden
-        recon = self.norm3(recon)
-
-        recon = self.norm4(recon + self.ff1(recon))
-
-        h = self.head(recon)
-
-        x_init = x[mask_nodes][gene_mask].view(mask_nodes.shape[0], -1)
-        x_recon = h[mask_nodes][gene_mask].view(mask_nodes.shape[0], -1)
-
-        return x_init, x_recon, encode_weights, recon
-
-    def transform():
-        raise NotImplemented("")
-
-    def get_gene_attn(self, separate_q_k:bool=False):
-        """Get gene attention matrix
-        
-        :param separate_q_k: If True, return Q and K. Otherwise, return Q.T @ K.
-
-        :return: Gene attention matrix
-        """
-        q = self.encoder.Q_real.weight.detach().cpu()
-        k = self.encoder.K_real.weight.detach().cpu()
-        if separate_q_k:
-            return q, k
+        if isinstance(features, list):
+            self.features = features
         else:
-            return q.T @ k
+            self.features = [f'feature_{i}' for i in range(features)]
 
-    def get_attn_and_embedding(self, dataset: _SpaceFormerDataset):
-        """Get attention weights and embeddings
-        
-        :param separate_q_k: If True, return Q and K. Otherwise, return Q.T @ K.
+        # Three way attention
+        d_in = len(self.features)
+        self.spatial_gather = BilinearAttention(d_in, d_ego, d_local, d_global, d_in)
 
-        :return: Gene attention matrix
-        """
-        encode_weights = []
-        embeddings = []
-        loader = DataLoader(dataset, batch_size=1, shuffle=False)
-        for batch in loader:
-            inputs = batch[0].to(device).squeeze(0)
-            real_edge_mask = batch[2].to(device).squeeze(0)
-            fake_edge_mask = batch[3].to(device).squeeze(0)
-            _, _, encode_weight, embedding = self(inputs, real_edge_mask, fake_edge_mask, )
-            encode_weights.append(encode_weight)
-            embeddings.append(embedding)
-        return encode_weights, embeddings
+    def masking(self, x, mask_rate):
+        # All cells are masked
+        random_mask = torch.rand(x.shape, device=x.get_device()) < mask_rate
+        out_x = x.clone()
+        out_x.masked_fill_(random_mask, 0.)
 
-    def fit(self, dataset: _SpaceFormerDataset, device:str='cuda', optim_type:str='adam', lr:float=1e-4, weight_decay:float=0., 
-            warmup=8, max_epoch:int=200, loss_fn:str='sce', log_dir:str='log/'):
+        return out_x
+
+    def forward(self, adj_matrix, x, masked_x, get_details=False, superego=False):
+        # Spatial component
+        z, sub_res, attn = self.spatial_gather(adj_matrix, x, masked_x, superego=superego)
+
+        # Max pooling with the input
+        # x_recon = torch.maximum(z, masked_x)
+        x_recon = z
+
+        if get_details:
+            return x_recon, sub_res, attn
+        else:
+            return x_recon
+
+    def fit(self, dataset: _SpaceFormerDataset, masking_rate=0.0, device:str='cuda', optim_type:str='adam', *, lr:float=1e-4, weight_decay:float=0., 
+            warmup=8, max_epoch:int=100, stop_eps=1e-3, stop_tol=3, loss_fn:str='mse', log_dir:str='log/'):
         """Create a PyTorch Dataset from a list of adata
 
         :param dataset: Dataset to be trained on
@@ -402,6 +217,8 @@ class SpaceFormer(nn.Module):
 
         :return: A `torch.Dataset` including all data.
         """
+        self.train()
+
         loader = DataLoader(dataset, batch_size=1, shuffle=True)
         parameters = self.parameters()
         opt_args = dict(lr=lr, weight_decay=weight_decay)
@@ -411,898 +228,139 @@ class SpaceFormer(nn.Module):
         elif optim_type == 'SGD':
             optimizer = optim.SGD(parameters, **opt_args)
 
-        scheduler = lambda epoch :( 1 + np.cos((epoch - warmup) * np.pi / (max_epoch - warmup)) ) * 0.5 if epoch >= warmup else (epoch / warmup)
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=scheduler)
+        # scheduler = lambda epoch :( 1 + np.cos((epoch - warmup) * np.pi / (max_epoch - warmup)) ) * 0.5 if epoch >= warmup else (epoch / warmup)
+        # scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=scheduler)
         
         if loss_fn == 'crossentropy':
             criterion = nn.CrossEntropyLoss()
         elif loss_fn == 'sce':
             criterion = partial(_sce_loss, alpha=3)
         elif loss_fn == "mse":
-            criterion = nn.MSELoss()    
+            criterion = nn.MSELoss()
 
         os.makedirs(log_dir, exist_ok=True)
         logger = _get_logger('train', log_dir)
-        writer = SummaryWriter(logdir=log_dir)
+        # writer = SummaryWriter(logdir=log_dir)
 
+        cnt = 0
+        last_avg_loss = np.inf
         for epoch in range(max_epoch):
-            self.train()
-            train_loss = 0
-            for batch in loader:
-                inputs = batch[0].to(device).squeeze(0)
-                labels = batch[1].to(device).squeeze(0)
-                real_edge_mask = batch[2].to(device).squeeze(0)
-                fake_edge_mask = batch[3].to(device).squeeze(0)
-                x_init, x_recon, encode_weights, embedding = self(inputs, real_edge_mask, fake_edge_mask)
-                loss = criterion(x_init, x_recon)
-                train_loss += loss.item()
+            total_loss = 0
+            for x, adj_matrix in loader:
+                x = x.to(device).squeeze(0)
+                adj_matrix = adj_matrix.to(device).squeeze(0)
+                masked_x = self.masking(x, masking_rate)
+                x_recon = self(adj_matrix, x, masked_x)
+                
+                loss = criterion(x, x_recon)
+                total_loss += loss.item()
 
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
 
-            logger.info(f"Epoch {epoch + 1}: train_loss {train_loss / len(loader)}")
-            writer.add_scalar('Train_Loss', train_loss / len(loader), epoch)
-            writer.add_scalar('Learning_Rate', optimizer.state_dict()["param_groups"][0]["lr"], epoch)
-            scheduler.step()
+            avg_loss = total_loss / len(loader)
+            logger.info(f"Epoch {epoch + 1}: train_loss {avg_loss:.5f}")
+            if last_avg_loss - avg_loss < stop_eps:
+                cnt += 1
+            if cnt >= stop_tol:
+                logger.info(f"Stopping criterion met.")
+                break
+            # writer.add_scalar('Train_Loss', train_loss / len(loader), epoch)
+            # writer.add_scalar('Learning_Rate', optimizer.state_dict()["param_groups"][0]["lr"], epoch)
+            # scheduler.step()
+        else:
+            logger.info(f"Maximum iterations reached.")
+
+        return self
+
+    def transform(self, x, adj_matrix):
+        self.eval()
+        with torch.no_grad():
+            if not isinstance(x, torch.Tensor):
+                x = torch.Tensor(x)
+            if not isinstance(adj_matrix, torch.Tensor):
+                adj_matrix = torch.BoolTensor(adj_matrix)
+            
+            res, (ego_res, local_res, global_res), (ego_attn, local_attn, global_attn) = self(adj_matrix, x, get_details=True)
+            return res, (ego_res, local_res, global_res), (ego_attn, local_attn, global_attn)
 
 
-class _SpatialTransformerCelltype(nn.Module):
-    def __init__(self, dropout, input_dim, ffn_dim, hidden_dim, output_dim, gamma):
-        super(_SpatialTransformerCelltype, self).__init__()
-        self.encoder = _SpatialAttention(input_dim, gamma)
-        self.dropout1 = nn.Dropout(dropout)
-        self.norm1 = nn.LayerNorm(input_dim)
+    def get_bias(self) -> np.array:
+        b = self.spatial_gather.bias.bias.detach().cpu().numpy()
+        return b.T
 
-        self.ff = nn.Sequential(
-            nn.Linear(input_dim, ffn_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(ffn_dim, input_dim),
-            nn.Dropout(dropout)
-        )
-        self.norm2 = nn.LayerNorm(input_dim)
-
-        self.decoder = _SpatialAttention(input_dim, gamma)
-        self.dropout2 = nn.Dropout(dropout)
-        self.norm3 = nn.LayerNorm(input_dim)
-
-        self.head = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, output_dim)
-        )
-
-    def forward(self, x, real_edge_mask, fake_edge_mask):
-        hidden, encode_weights = self.encoder(x, real_edge_mask, fake_edge_mask)
-        hidden = self.dropout1(hidden)
-        hidden = hidden + x
-        hidden = self.norm1(hidden)
-
-        hidden = self.norm2(hidden + self.ff(hidden))
-
-        recon, decode_weights = self.decoder(hidden, real_edge_mask, fake_edge_mask)
-        recon = self.dropout2(recon)
-        recon = recon + hidden
-        recon = self.norm3(recon)
-
-        h = self.head(recon)
-
-        return h
-
-
-def _build_model_celltype(args):
-    if args.model == 'MLP':
-        model = _MLPCelltype(args.input_dim, args.hidden_dim, args.output_dim)
-    elif args.model == 'Mean':
-        model = _MeanCelltype(args.n_neighs, args.input_dim, args.hidden_dim, args.output_dim)
-    elif args.model == 'MeanAdd':
-        model = _MeanAddCelltype(args.n_neighs, args.input_dim, args.hidden_dim, args.output_dim)
-    elif args.model == 'Covet':
-        model = _CovetCelltype(args.n_neighs, args.input_dim, args.hidden_dim, args.output_dim)
-    elif args.model == 'GlobalTransformer':
-        model = _GlobalTransformerCelltype(args.dropout, args.input_dim, args.ffn_dim, args.hidden_dim, args.output_dim)
-    elif args.model == 'LocalTransformer':
-        model = _LocalTransformerCelltype(args.dropout, args.input_dim, args.ffn_dim, args.hidden_dim, args.output_dim)
-    elif args.model == 'SpatialTransformer':
-        model = _SpatialTransformerCelltype(args.dropout, args.input_dim, args.ffn_dim, args.hidden_dim, args.output_dim, args.gamma)
-    return model
-
-
-class _GlobalTransformerPretrain(nn.Module):
-    def __init__(self, cell_mask_rate, gene_mask_rate, dropout, input_dim, ffn_dim):
-        super(_GlobalTransformerPretrain, self).__init__()
-        self.cell_mask_rate = cell_mask_rate
-        self.gene_mask_rate = gene_mask_rate
-
-        self.encoder = _Attention(input_dim)
-        self.dropout1 = nn.Dropout(dropout)
-        self.norm1 = nn.LayerNorm(input_dim)
-
-        self.ff = nn.Sequential(
-            nn.Linear(input_dim, ffn_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(ffn_dim, input_dim),
-            nn.Dropout(dropout)
-        )
-        self.norm2 = nn.LayerNorm(input_dim)
-
-        self.decoder = _Attention(input_dim)
-        self.dropout2 = nn.Dropout(dropout)
-        self.norm3 = nn.LayerNorm(input_dim)
+    def get_ego_transform(self) -> np.array:
+        """Get gene attention matrix
         
-        self.ff1 = nn.Sequential(
-            nn.Linear(input_dim, ffn_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(ffn_dim, input_dim),
-            nn.Dropout(dropout)
-        )
-        self.norm4 = nn.LayerNorm(input_dim)
+        :param separate_q_k: If True, return Q and K. Otherwise, return Q.T @ K.
 
-        self.head = nn.Linear(input_dim, input_dim)
-
-    def encoding_mask_nodes(self, x, cell_mask_rate, gene_mask_rate):
-        num_nodes = x.shape[0]
-        perm = torch.randperm(num_nodes, device=x.device)
-        num_mask_nodes = int(cell_mask_rate * num_nodes)
-        mask_nodes = perm[: num_mask_nodes]
-
-        mask_x = x[mask_nodes].clone()
-        gene_mask = torch.zeros_like(mask_x, dtype=torch.bool).to(x.device)
-        for i in range(mask_x.size(0)):
-            num_to_zero =  int(gene_mask_rate * mask_x.size(1))
-            indices_to_zero = torch.randperm(mask_x.size(1))[:num_to_zero]
-            mask_x[i, indices_to_zero] = 0
-            gene_mask[i, indices_to_zero] = True
-        
-        out_x = x.clone()
-        out_x[mask_nodes] = mask_x
-
-        return out_x, mask_nodes, gene_mask
-
-    def forward(self, x):
-        use_x, mask_nodes, gene_mask = self.encoding_mask_nodes(x, self.cell_mask_rate, self.gene_mask_rate)
-
-        hidden, encode_weights = self.encoder(use_x)
-        hidden = self.dropout1(hidden)
-        hidden = hidden + use_x
-        hidden = self.norm1(hidden)
-
-        hidden = self.norm2(hidden + self.ff(hidden))
-
-        hidden[mask_nodes][gene_mask] = 0
-
-        recon, decode_weights = self.decoder(hidden)
-        recon = self.dropout2(recon)
-        recon = recon + hidden
-        recon = self.norm3(recon)
-
-        recon = self.norm4(recon + self.ff(recon))
-
-        h = self.head(recon)
-
-        x_init = x[mask_nodes][gene_mask].view(mask_nodes.shape[0], -1)
-        x_recon = h[mask_nodes][gene_mask].view(mask_nodes.shape[0], -1)
-
-        return x_init, x_recon, encode_weights, recon
-    
-
-class _LocalTransformerPretrain(nn.Module):
-    def __init__(self, cell_mask_rate, gene_mask_rate, dropout, input_dim, ffn_dim):
-        super(_LocalTransformerPretrain, self).__init__()
-        self.cell_mask_rate = cell_mask_rate
-        self.gene_mask_rate = gene_mask_rate
-
-        self.encoder = _LocalAttention(input_dim)
-        self.dropout1 = nn.Dropout(dropout)
-        self.norm1 = nn.LayerNorm(input_dim)
-
-        self.ff = nn.Sequential(
-            nn.Linear(input_dim, ffn_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(ffn_dim, input_dim),
-            nn.Dropout(dropout)
-        )
-        self.norm2 = nn.LayerNorm(input_dim)
-
-        self.decoder = LocalAttention(input_dim)
-        self.dropout2 = nn.Dropout(dropout)
-        self.norm3 = nn.LayerNorm(input_dim)
-
-        self.ff1 = nn.Sequential(
-            nn.Linear(input_dim, ffn_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(ffn_dim, input_dim),
-            nn.Dropout(dropout)
-        )
-        self.norm4 = nn.LayerNorm(input_dim)
-
-        self.head = nn.Linear(input_dim, input_dim)
-
-    def encoding_mask_nodes(self, x, cell_mask_rate, gene_mask_rate):
-        num_nodes = x.shape[0]
-        perm = torch.randperm(num_nodes, device=x.device)
-        num_mask_nodes = int(cell_mask_rate * num_nodes)
-        mask_nodes = perm[: num_mask_nodes]
-
-        mask_x = x[mask_nodes].clone()
-        gene_mask = torch.zeros_like(mask_x, dtype=torch.bool).to(x.device)
-        for i in range(mask_x.size(0)):
-            num_to_zero =  int(gene_mask_rate * mask_x.size(1))
-            indices_to_zero = torch.randperm(mask_x.size(1))[:num_to_zero]
-            mask_x[i, indices_to_zero] = 0
-            gene_mask[i, indices_to_zero] = True
-        
-        out_x = x.clone()
-        out_x[mask_nodes] = mask_x
-
-        return out_x, mask_nodes, gene_mask
-
-    def forward(self, x, real_edge_mask, fake_edge_mask):
-        use_x, mask_nodes, gene_mask = self.encoding_mask_nodes(x, self.cell_mask_rate, self.gene_mask_rate)
-
-        hidden, encode_weights = self.encoder(use_x, real_edge_mask)
-        hidden = self.dropout1(hidden)
-        hidden = hidden + use_x
-        hidden = self.norm1(hidden)
-
-        hidden = self.norm2(hidden + self.ff(hidden))
-
-        hidden[mask_nodes][gene_mask] = 0
-
-        recon, decode_weights = self.decoder(hidden, real_edge_mask)
-        recon = self.dropout2(recon)
-        recon = recon + hidden
-        recon = self.norm3(recon)
-
-        recon = self.norm4(recon + self.ff1(recon))
-
-        h = self.head(recon)
-
-        x_init = x[mask_nodes][gene_mask].view(mask_nodes.shape[0], -1)
-        x_recon = h[mask_nodes][gene_mask].view(mask_nodes.shape[0], -1)
-
-        return x_init, x_recon, encode_weights, recon
-
-
-class _SpatialTransformerPretrain(nn.Module):
-    def __init__(self, cell_mask_rate, gene_mask_rate, dropout, input_dim, ffn_dim, gamma):
+        :return: Gene attention vectors
         """
+        # qk = self.spatial_gather.qk_ego.weight.detach().cpu().numpy()
+        qk = self.spatial_gather.v_ego.weight2.detach().cpu().numpy()
+        v = self.spatial_gather.v_ego.weight.detach().cpu().numpy()
+        return qk.T, v.T
+
+    def get_local_transform(self) -> np.array:
+        """Get gene attention matrix
+        
+        :param separate_q_k: If True, return Q and K. Otherwise, return Q.T @ K.
+
+        :return: Gene attention vectors
         """
-        super(_SpatialTransformerPretrain, self).__init__()
-        self.cell_mask_rate = cell_mask_rate
-        self.gene_mask_rate = gene_mask_rate
-
-        self.encoder = _SpatialAttention(input_dim, gamma)
-        self.dropout1 = nn.Dropout(dropout)
-        self.norm1 = nn.LayerNorm(input_dim)
-
-        self.ff = nn.Sequential(
-            nn.Linear(input_dim, ffn_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(ffn_dim, input_dim),
-            nn.Dropout(dropout)
-        )
-        self.norm2 = nn.LayerNorm(input_dim)
-
-        self.decoder = _SpatialAttention(input_dim, gamma)
-        self.dropout2 = nn.Dropout(dropout)
-        self.norm3 = nn.LayerNorm(input_dim)
-
-        self.ff1 = nn.Sequential(
-            nn.Linear(input_dim, ffn_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(ffn_dim, input_dim),
-            nn.Dropout(dropout)
-        )
-        self.norm4 = nn.LayerNorm(input_dim)
-
-        self.head = nn.Linear(input_dim, input_dim)
-
-    def encoding_mask_nodes(self, x, cell_mask_rate, gene_mask_rate):
-        num_nodes = x.shape[0]
-        perm = torch.randperm(num_nodes, device=x.device)
-        num_mask_nodes = int(cell_mask_rate * num_nodes)
-        mask_nodes = perm[: num_mask_nodes]
-
-        mask_x = x[mask_nodes].clone()
-        gene_mask = torch.zeros_like(mask_x, dtype=torch.bool).to(x.device)
-        for i in range(mask_x.size(0)):
-            num_to_zero =  int(gene_mask_rate * mask_x.size(1))
-            indices_to_zero = torch.randperm(mask_x.size(1))[:num_to_zero]
-            mask_x[i, indices_to_zero] = 0
-            gene_mask[i, indices_to_zero] = True
+        q = self.spatial_gather.q_local.weight.detach().cpu().numpy()
+        k = self.spatial_gather.k_local.weight.detach().cpu().numpy()
+        v = self.spatial_gather.v_local.weight.detach().cpu().numpy()
+        return q, k, v.T
         
-        out_x = x.clone()
-        out_x[mask_nodes] = mask_x
+    def get_global_transform(self) -> np.array:
+        """Get gene attention matrix
+        
+        :param separate_q_k: If True, return Q and K. Otherwise, return Q.T @ K.
 
-        return out_x, mask_nodes, gene_mask
+        :return: Gene attention matrix
+        """
+        q = self.spatial_gather.q_global.weight.detach().cpu().numpy()
+        k = self.spatial_gather.k_global.weight.detach().cpu().numpy()
+        v = self.spatial_gather.v_global.weight.detach().cpu().numpy()
+        return q, k, v.T
+       
+    def score_cells(self, x):
+        if isinstance(x, torch.Tensor):
+            x = x.cpu().numpy()
+        res = {}
+        qk_ego, v_ego = self.get_ego_transform()
+        for i in range(qk_ego.shape[0]):
+            res[f'u_ego_{i}'] = x @ qk_ego[i, :]
+        q_local, k_local, v_local = self.get_local_transform()
+        for i in range(q_local.shape[0]):
+            res[f'q_local_{i}'] = x @ q_local[i, :]
+            res[f'k_local_{i}'] = x @ k_local[i, :]
+        if self.spatial_gather.d_global > 0:
+            q_global, k_global, v_global = self.get_global_transform()
+        for i in range(q_global.shape[0]):
+            res[f'q_global_{i}'] = x @ q_global[i, :]
+        return res
 
-    def forward(self, x, real_edge_mask, fake_edge_mask):
-        use_x, mask_nodes, gene_mask = self.encoding_mask_nodes(x, self.cell_mask_rate, self.gene_mask_rate)
-
-        hidden, encode_weights = self.encoder(use_x, real_edge_mask, fake_edge_mask)
-        hidden = self.dropout1(hidden)
-        hidden = hidden + use_x
-        hidden = self.norm1(hidden)
-
-        hidden = self.norm2(hidden + self.ff(hidden))
-
-        hidden[mask_nodes][gene_mask] = 0
-
-        recon, decode_weights = self.decoder(hidden, real_edge_mask, fake_edge_mask)
-        recon = self.dropout2(recon)
-        recon = recon + hidden
-        recon = self.norm3(recon)
-
-        recon = self.norm4(recon + self.ff1(recon))
-
-        h = self.head(recon)
-
-        x_init = x[mask_nodes][gene_mask].view(mask_nodes.shape[0], -1)
-        x_recon = h[mask_nodes][gene_mask].view(mask_nodes.shape[0], -1)
-
-        return x_init, x_recon, encode_weights, recon
-
-
-def _build_model_pretrain(args):
-    if args.model == 'GlobalTransformer':
-        model = _GlobalTransformerPretrain(args.cell_mask_rate, args.gene_mask_rate, args.dropout, args.input_dim, args.ffn_dim)
-    elif args.model == 'LocalTransformer':
-        model = _LocalTransformerPretrain(args.cell_mask_rate, args.gene_mask_rate, args.dropout, args.input_dim, args.ffn_dim)
-    elif args.model == 'SpatialTransformer':
-        model = _SpatialTransformerPretrain(args.cell_mask_rate, args.gene_mask_rate, args.dropout, args.input_dim, args.ffn_dim, args.gamma)
-    return model
-
-
-class _MLPImputation(nn.Module):
-    def __init__(self, input_dim, hidden_dim, imputation_rate):
-        super(_MLPImputation, self).__init__()
-        self.imputation_rate = imputation_rate
-
-        self.mlp = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, input_dim)
-        )
-
-    def drop(self, x, gene_list, num_drop):
-        mask = torch.zeros_like(x, dtype=bool)
+    def get_top_features(self, top_k=5):
+        res = {}
+        features = np.array(self.features)
+        qk_ego, v_ego = self.get_ego_transform()
+        for i in range(qk_ego.shape[0]):
+            res[f'U_ego_{i}'] = features[np.argsort(-qk_ego[i, :])[:top_k]].tolist()
+            # res[f'V_ego_{i}'] = features[np.argsort(-v_ego[i, :])[:top_k]].tolist()
+        q_local, k_local, v_local = self.get_local_transform()
+        for i in range(q_local.shape[0]):
+            res[f'Q_local_{i}'] = features[np.argsort(-q_local[i, :])[:top_k]].tolist()
+            res[f'K_local_{i}'] = features[np.argsort(-k_local[i, :])[:top_k]].tolist()
+            res[f'V_local_{i}'] = features[np.argsort(-v_local[i, :])[:top_k]].tolist()
+        if self.spatial_gather.d_global > 0:
+            q_global, k_global, v_global = self.get_global_transform()
+            for i in range(q_global.shape[0]):
+                res[f'Q_global_{i}'] = features[np.argsort(-q_global[i, :])[:top_k]].tolist()
+                res[f'K_global_{i}'] = features[np.argsort(-k_global[i, :])[:top_k]].tolist()
+                res[f'V_global_{i}'] = features[np.argsort(-v_global[i, :])[:top_k]].tolist()
+        return res
     
-        for i in range(x.shape[0]):
-            random_indices = torch.randperm(len(gene_list), device=x.device)[:num_drop]
-            dropout_indices = gene_list[random_indices]
-            mask[i, dropout_indices] = True
-        
-        drop_x = x.clone()
-        drop_x[mask] = 0
-
-        return drop_x, mask
-
-    def forward(self, x, gene_list):
-        drop_x, drop_mask = self.drop(x, gene_list, int(self.imputation_rate * len(gene_list)))
-        recon = self.mlp(drop_x)
-
-        x_init = x[drop_mask].reshape(x.shape[0], -1)
-        x_recon = recon[drop_mask].reshape(x.shape[0], -1)
-
-        return x_init, x_recon
     
-    def preprocess(self, x):
-        adata = sc.AnnData(X=x.detach().cpu().numpy())
-        sc.pp.normalize_total(adata)
-        sc.pp.log1p(adata)
-        sc.pp.scale(adata, zero_center=False)
-        X = adata.X
-        return torch.from_numpy(X).to(x.device)
-
-    def evaluation(self, raw, gene_list):
-        drop_raw, drop_mask = self.drop(raw, gene_list, int(self.imputation_rate * len(gene_list)))
-        drop_x = self.preprocess(drop_raw)
-
-        recon = self.mlp(drop_x)
-
-        pearson_list = []
-        spearman_list = []
-        for i in range(len(gene_list)):
-            gene_idx = gene_list[i]
-            gene_init = raw[:, gene_idx]
-            gene_recon = recon[:, gene_idx]
-
-            mask = torch.nonzero(gene_init, as_tuple=True)[0]
-            if len(np.unique(gene_init[mask].detach().cpu().numpy())) < 2:
-                continue
-            
-            pearson, _ = pearsonr(gene_init[mask].detach().cpu().numpy(), gene_recon[mask].detach().cpu().numpy())
-            pearson_list.append(pearson)
-            spearman, _ = spearmanr(gene_init[mask].detach().cpu().numpy(), gene_recon[mask].detach().cpu().numpy())
-            spearman_list.append(spearman)
-
-        return pearson_list, spearman_list
-    
-
-class _MeanImputation(nn.Module):
-    def __init__(self, n_neighs, input_dim, hidden_dim, imputation_rate):
-        super(_MeanImputation, self).__init__()
-        self.n_neighs = n_neighs
-        self.imputation_rate = imputation_rate
-
-        self.mlp = nn.Sequential(
-            nn.Linear(input_dim + input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, input_dim)
-        )
-
-    def drop(self, x, gene_list, num_drop):
-        mask = torch.zeros_like(x, dtype=bool)
-    
-        for i in range(x.shape[0]):
-            random_indices = torch.randperm(len(gene_list), device=x.device)[:num_drop]
-            dropout_indices = gene_list[random_indices]
-            mask[i, dropout_indices] = True
-        
-        drop_x = x.clone()
-        drop_x[mask] = 0
-
-        return drop_x, mask
-
-    def forward(self, x, gene_list, real_edge_mask, fake_edge_mask):
-        drop_x, drop_mask = self.drop(x, gene_list, int(self.imputation_rate * len(gene_list)))
-        
-        node_indices = torch.nonzero(fake_edge_mask > 0)[:, 1]
-        niche_feat = drop_x[node_indices].reshape(drop_x.shape[0], self.n_neighs, -1)
-        res = torch.sum(niche_feat, dim=1) / self.n_neighs
-        hidden = torch.cat((drop_x, res), dim=1)
-        
-        recon = self.mlp(hidden)
-
-        x_init = x[drop_mask].reshape(x.shape[0], -1)
-        x_recon = recon[drop_mask].reshape(x.shape[0], -1)
-
-        return x_init, x_recon
-    
-    def preprocess(self, x):
-        adata = sc.AnnData(X=x.detach().cpu().numpy())
-        sc.pp.normalize_total(adata)
-        sc.pp.log1p(adata)
-        sc.pp.scale(adata, zero_center=False)
-        X = adata.X
-        return torch.from_numpy(X).to(x.device)
-
-    def evaluation(self, raw, gene_list, real_edge_mask, fake_edge_mask):
-        drop_raw, drop_mask = self.drop(raw, gene_list, int(self.imputation_rate * len(gene_list)))
-        drop_x = self.preprocess(drop_raw)
-
-        node_indices = torch.nonzero(fake_edge_mask > 0)[:, 1]
-        niche_feat = drop_x[node_indices].reshape(drop_x.shape[0], self.n_neighs, -1)
-        res = torch.sum(niche_feat, dim=1) / self.n_neighs
-        hidden = torch.cat((drop_x, res), dim=1)
-
-        recon = self.mlp(hidden)
-
-        pearson_list = []
-        spearman_list = []
-        for i in range(len(gene_list)):
-            gene_idx = gene_list[i]
-
-            gene_mask_i = drop_mask[:, gene_idx]
-            
-            gene_init = raw[:, gene_idx][gene_mask_i]
-            gene_recon = recon[:, gene_idx][gene_mask_i]
-
-            pearson, _ = pearsonr(gene_init.detach().cpu().numpy(), gene_recon.detach().cpu().numpy())
-            pearson_list.append(pearson)
-            spearman, _ = spearmanr(gene_init.detach().cpu().numpy(), gene_recon.detach().cpu().numpy())
-            spearman_list.append(spearman)
-
-        return pearson_list, spearman_list
-    
-
-class _CovetImputation(nn.Module):
-    def __init__(self, n_neighs, input_dim, hidden_dim, imputation_rate):
-        super(_CovetImputation, self).__init__()
-        self.imputation_rate = imputation_rate
-        self.n_neighs = n_neighs
-
-        self.mlp = nn.Sequential(
-            nn.Linear(input_dim + 32 * 32, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, input_dim)
-        )
-
-    def drop(self, x, gene_list, num_drop):
-        mask = torch.zeros_like(x, dtype=bool)
-    
-        for i in range(x.shape[0]):
-            random_indices = torch.randperm(len(gene_list), device=x.device)[:num_drop]
-            dropout_indices = gene_list[random_indices]
-            mask[i, dropout_indices] = True
-        
-        drop_x = x.clone()
-        drop_x[mask] = 0
-
-        return drop_x, mask
-
-    def forward(self, x, gene_list, coordinates, highly_variable_genes):
-        drop_x, drop_mask = self.drop(x, gene_list, int(self.imputation_rate * len(gene_list)))
-        
-        res = covet_sqrt(highly_variable_genes.cpu().numpy(), coordinates.cpu().numpy(), self.n_neighs)
-        res = torch.from_numpy(res.reshape(-1, 32 * 32)).to(x.device)
-        hidden = torch.cat((drop_x, res), dim=1)
-
-        recon = self.mlp(hidden)
-
-        x_init = x[drop_mask].reshape(x.shape[0], -1)
-        x_recon = recon[drop_mask].reshape(x.shape[0], -1)
-
-        return x_init, x_recon
-    
-    def preprocess(self, x):
-        adata = sc.AnnData(X=x.detach().cpu().numpy())
-        sc.pp.normalize_total(adata)
-        sc.pp.log1p(adata)
-        sc.pp.scale(adata, zero_center=False)
-        X = adata.X
-        return torch.from_numpy(X).to(x.device)
-
-    def evaluation(self, raw, gene_list, coordinates, highly_variable_genes):
-        drop_raw, drop_mask = self.drop(raw, gene_list, int(self.imputation_rate * len(gene_list)))
-        drop_x = self.preprocess(drop_raw)
-
-        res = covet_sqrt(highly_variable_genes.cpu().numpy(), coordinates.cpu().numpy(), self.n_neighs)
-        res = torch.from_numpy(res.reshape(-1, 32 * 32)).to(drop_x.device)
-        hidden = torch.cat((drop_x, res), dim=1)
-        
-        recon = self.mlp(hidden)
-
-        pearson_list = []
-        spearman_list = []
-        for i in range(len(gene_list)):
-            gene_idx = gene_list[i]
-
-            gene_mask_i = drop_mask[:, gene_idx]
-            
-            gene_init = raw[:, gene_idx][gene_mask_i]
-            gene_recon = recon[:, gene_idx][gene_mask_i]
-
-            pearson, _ = pearsonr(gene_init.detach().cpu().numpy(), gene_recon.detach().cpu().numpy())
-            pearson_list.append(pearson)
-            spearman, _ = spearmanr(gene_init.detach().cpu().numpy(), gene_recon.detach().cpu().numpy())
-            spearman_list.append(spearman)
-
-        return pearson_list, spearman_list
-
-
-class _GlobalTransformerImputation(nn.Module):
-    def __init__(self, input_dim, ffn_dim, dropout, imputation_rate):
-        super(_GlobalTransformerImputation, self).__init__()
-
-        self.imputation_rate = imputation_rate
-
-        self.encoder = Attention(input_dim)
-        self.dropout1 = nn.Dropout(dropout)
-        self.norm1 = nn.LayerNorm(input_dim)
-
-        self.ff = nn.Sequential(
-            nn.Linear(input_dim, ffn_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(ffn_dim, input_dim),
-            nn.Dropout(dropout)
-        )
-        self.norm2 = nn.LayerNorm(input_dim)
-
-        self.decoder = _Attention(input_dim)
-        self.dropout2 = nn.Dropout(dropout)
-        self.norm3 = nn.LayerNorm(input_dim)
-
-        self.head = nn.Linear(input_dim, input_dim)
-
-    def drop(self, x, gene_list, num_drop):
-        mask = torch.zeros_like(x, dtype=bool)
-    
-        for i in range(x.shape[0]):
-            random_indices = torch.randperm(len(gene_list))[:num_drop]
-            dropout_indices = gene_list[random_indices]
-            mask[i, dropout_indices] = True
-        
-        drop_x = x.clone()
-        drop_x[mask] = 0
-
-        return drop_x, mask
-
-    def forward(self, x, gene_list):
-        drop_x, drop_mask = self.drop(x, gene_list, int(self.imputation_rate * len(gene_list)))
-        
-        hidden, encode_weights = self.encoder(drop_x)
-        hidden = self.dropout1(hidden)
-        hidden = hidden + drop_x
-        hidden = self.norm1(hidden)
-
-        hidden = self.norm2(hidden + self.ff(hidden))
-
-        recon, decode_weights = self.decoder(hidden)
-        recon = self.dropout2(recon)
-        recon = recon + hidden
-        recon = self.norm3(recon)
-
-        h = self.head(recon)
-
-        x_init = x[drop_mask].reshape(x.shape[0], -1)
-        x_recon = h[drop_mask].reshape(x.shape[0], -1)
-
-        return x_init, x_recon
-
-    def preprocess(self, x):
-        adata = sc.AnnData(X=x.detach().cpu().numpy())
-        sc.pp.normalize_total(adata)
-        sc.pp.log1p(adata)
-        sc.pp.scale(adata, zero_center=False)
-        X = adata.X
-        return torch.from_numpy(X).to(x.device)
-    
-    def evaluation(self, raw, gene_list):
-        drop_raw, drop_mask = self.drop(raw, gene_list, int(self.imputation_rate * len(gene_list)))
-        drop_x = self.preprocess(drop_raw)
-
-        hidden, encode_weights = self.encoder(drop_x)
-        hidden = self.dropout1(hidden)
-        hidden = hidden + drop_x
-        hidden = self.norm1(hidden)
-
-        hidden = self.norm2(hidden + self.ff(hidden))
-
-        recon, decode_weights = self.decoder(hidden)
-        recon = self.dropout2(recon)
-        recon = recon + hidden
-        recon = self.norm3(recon)
-
-        h = self.head(recon)
-        
-        pearson_list = []
-        spearman_list = []
-        for i in range(len(gene_list)):
-            gene_idx = gene_list[i]
-            gene_init = raw[:, gene_idx]
-            gene_recon = h[:, gene_idx]
-
-            mask = torch.nonzero(gene_init, as_tuple=True)[0]
-            if len(np.unique(gene_init[mask].detach().cpu().numpy())) < 2:
-                continue
-
-            pearson, _ = pearsonr(gene_init[mask].detach().cpu().numpy(), gene_recon[mask].detach().cpu().numpy())
-            pearson_list.append(pearson)
-            spearman, _ = spearmanr(gene_init[mask].detach().cpu().numpy(), gene_recon[mask].detach().cpu().numpy())
-            spearman_list.append(spearman)
-
-        return pearson_list, spearman_list
-    
-
-class _LocalTransformerImputation(nn.Module):
-    def __init__(self, input_dim, ffn_dim, dropout, imputation_rate):
-        super(_LocalTransformerImputation, self).__init__()
-
-        self.imputation_rate = imputation_rate
-
-        self.encoder = _LocalAttention(input_dim)
-        self.dropout1 = nn.Dropout(dropout)
-        self.norm1 = nn.LayerNorm(input_dim)
-
-        self.ff = nn.Sequential(
-            nn.Linear(input_dim, ffn_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(ffn_dim, input_dim),
-            nn.Dropout(dropout)
-        )
-        self.norm2 = nn.LayerNorm(input_dim)
-
-        self.decoder = _LocalAttention(input_dim)
-        self.dropout2 = nn.Dropout(dropout)
-        self.norm3 = nn.LayerNorm(input_dim)
-
-        self.head = nn.Linear(input_dim, input_dim)
-
-    def drop(self, x, gene_list, num_drop):
-        mask = torch.zeros_like(x, dtype=bool)
-    
-        for i in range(x.shape[0]):
-            random_indices = torch.randperm(len(gene_list))[:num_drop]
-            dropout_indices = gene_list[random_indices]
-            mask[i, dropout_indices] = True
-        
-        drop_x = x.clone()
-        drop_x[mask] = 0
-
-        return drop_x, mask
-
-    def forward(self, x, gene_list, real_edge_mask, fake_edge_mask):
-        drop_x, drop_mask = self.drop(x, gene_list, int(self.imputation_rate * len(gene_list)))
-        
-        hidden, encode_weights = self.encoder(drop_x, real_edge_mask)
-        hidden = self.dropout1(hidden)
-        hidden = hidden + drop_x
-        hidden = self.norm1(hidden)
-
-        hidden = self.norm2(hidden + self.ff(hidden))
-
-        recon, decode_weights = self.decoder(hidden, real_edge_mask)
-        recon = self.dropout2(recon)
-        recon = recon + hidden
-        recon = self.norm3(recon)
-
-        h = self.head(recon)
-
-        x_init = x[drop_mask].reshape(x.shape[0], -1)
-        x_recon = h[drop_mask].reshape(x.shape[0], -1)
-
-        return x_init, x_recon
-
-    def preprocess(self, x):
-        adata = sc.AnnData(X=x.detach().cpu().numpy())
-        sc.pp.normalize_total(adata)
-        sc.pp.log1p(adata)
-        sc.pp.scale(adata, zero_center=False)
-        X = adata.X
-        return torch.from_numpy(X).to(x.device)
-    
-    def evaluation(self, raw, gene_list, real_edge_mask, fake_edge_mask):
-        drop_raw, drop_mask = self.drop(raw, gene_list, int(self.imputation_rate * len(gene_list)))
-        drop_x = self.preprocess(drop_raw)
-
-        hidden, encode_weights = self.encoder(drop_x, real_edge_mask)
-        hidden = self.dropout1(hidden)
-        hidden = hidden + drop_x
-        hidden = self.norm1(hidden)
-
-        hidden = self.norm2(hidden + self.ff(hidden))
-
-        recon, decode_weights = self.decoder(hidden, real_edge_mask)
-        recon = self.dropout2(recon)
-        recon = recon + hidden
-        recon = self.norm3(recon)
-
-        h = self.head(recon)
-        
-        pearson_list = []
-        spearman_list = []
-        for i in range(len(gene_list)):
-            gene_idx = gene_list[i]
-
-            gene_mask_i = drop_mask[:, gene_idx]
-            
-            gene_init = raw[:, gene_idx][gene_mask_i]
-            gene_recon = h[:, gene_idx][gene_mask_i]
-
-            pearson, _ = pearsonr(gene_init.detach().cpu().numpy(), gene_recon.detach().cpu().numpy())
-            pearson_list.append(pearson)
-            spearman, _ = spearmanr(gene_init.detach().cpu().numpy(), gene_recon.detach().cpu().numpy())
-            spearman_list.append(spearman)
-
-        return pearson_list, spearman_list
-
-
-class _SpatialTransformerImputation(nn.Module):
-    def __init__(self, input_dim, ffn_dim, dropout, imputation_rate, gamma):
-        super(_SpatialTransformerImputation, self).__init__()
-
-        self.imputation_rate = imputation_rate
-
-        self.encoder = _SpatialAttention(input_dim, gamma)
-        self.dropout1 = nn.Dropout(dropout)
-        self.norm1 = nn.LayerNorm(input_dim)
-
-        self.ff = nn.Sequential(
-            nn.Linear(input_dim, ffn_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(ffn_dim, input_dim),
-            nn.Dropout(dropout)
-        )
-        self.norm2 = nn.LayerNorm(input_dim)
-
-        self.decoder = _SpatialAttention(input_dim, gamma)
-        self.dropout2 = nn.Dropout(dropout)
-        self.norm3 = nn.LayerNorm(input_dim)
-
-        self.head = nn.Linear(input_dim, input_dim)
-
-    def drop(self, x, gene_list, num_drop):
-        mask = torch.zeros_like(x, dtype=bool)
-    
-        for i in range(x.shape[0]):
-            random_indices = torch.randperm(len(gene_list))[:num_drop]
-            dropout_indices = gene_list[random_indices]
-            mask[i, dropout_indices] = True
-        
-        drop_x = x.clone()
-        drop_x[mask] = 0
-
-        return drop_x, mask
-
-    def forward(self, x, gene_list, real_edge_mask, fake_edge_mask):
-        drop_x, drop_mask = self.drop(x, gene_list, int(self.imputation_rate * len(gene_list)))
-        
-        hidden, encode_weights = self.encoder(drop_x, real_edge_mask, fake_edge_mask)
-        hidden = self.dropout1(hidden)
-        hidden = hidden + drop_x
-        hidden = self.norm1(hidden)
-
-        hidden = self.norm2(hidden + self.ff(hidden))
-
-        recon, decode_weights = self.decoder(hidden, real_edge_mask, fake_edge_mask)
-        recon = self.dropout2(recon)
-        recon = recon + hidden
-        recon = self.norm3(recon)
-
-        h = self.head(recon)
-
-        x_init = x[drop_mask].reshape(x.shape[0], -1)
-        x_recon = h[drop_mask].reshape(x.shape[0], -1)
-
-        return x_init, x_recon
-    
-    def preprocess(self, x):
-        adata = sc.AnnData(X=x.detach().cpu().numpy())
-        sc.pp.normalize_total(adata)
-        sc.pp.log1p(adata)
-        sc.pp.scale(adata, zero_center=False)
-        X = adata.X
-        return torch.from_numpy(X).to(x.device)
-    
-    def evaluation(self, raw, gene_list, real_edge_mask, fake_edge_mask):
-        drop_raw, drop_mask = self.drop(raw, gene_list, int(self.imputation_rate * len(gene_list)))
-        drop_x = self.preprocess(drop_raw)
-
-        hidden, encode_weights = self.encoder(drop_x, real_edge_mask, fake_edge_mask)
-        hidden = self.dropout1(hidden)
-        hidden = hidden + drop_x
-        hidden = self.norm1(hidden)
-
-        hidden = self.norm2(hidden + self.ff(hidden))
-
-        recon, decode_weights = self.decoder(hidden, real_edge_mask, fake_edge_mask)
-        recon = self.dropout2(recon)
-        recon = recon + hidden
-        recon = self.norm3(recon)
-
-        h = self.head(recon)
-        
-        pearson_list = []
-        spearman_list = []
-        for i in range(len(gene_list)):
-            gene_idx = gene_list[i]
-
-            gene_mask_i = drop_mask[:, gene_idx]
-            
-            gene_init = raw[:, gene_idx][gene_mask_i]
-            gene_recon = h[:, gene_idx][gene_mask_i]
-
-            pearson, _ = pearsonr(gene_init.detach().cpu().numpy(), gene_recon.detach().cpu().numpy())
-            pearson_list.append(pearson)
-            spearman, _ = spearmanr(gene_init.detach().cpu().numpy(), gene_recon.detach().cpu().numpy())
-            spearman_list.append(spearman)
-
-        return pearson_list, spearman_list
-
-
-def _build_model_imputation(args):
-    if args.model == 'MLP':
-        model = _MLPImputation(args.input_dim, args.hidden_dim, args.imputation_rate)
-    elif args.model == 'Mean':
-        model = _MeanImputation(args.n_neighs, args.input_dim, args.hidden_dim, args.imputation_rate)
-    elif args.model == 'Covet':
-        model = _CovetImputation(args.n_neighs, args.input_dim, args.hidden_dim, args.imputation_rate)
-    elif args.model == 'GlobalTransformer':
-        model = _GlobalTransformerImputation(args.input_dim, args.ffn_dim, args.dropout, args.imputation_rate)
-    elif args.model == 'LocalTransformer':
-        model = _LocalTransformerImputation(args.input_dim, args.ffn_dim, args.dropout, args.imputation_rate)
-    elif args.model == 'SpatialTransformer':
-        model = _SpatialTransformerImputation(args.input_dim, args.ffn_dim, args.dropout, args.imputation_rate, args.gamma)
-    return model
