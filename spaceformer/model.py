@@ -91,7 +91,29 @@ class BilinearAttention(nn.Module):
             self.k_global = None
             self.v_global = None
 
-    def forward(self, adj_matrix, x, masked_x=None, x_bar=None, superego=False):
+    def score_local(self, adj_matrix, x, masked_x=None):
+        if masked_x is None:
+            masked_x = x
+        q_local = self.q_local(masked_x) # n * g -> n * d
+        k_local = self.k_local(x) # n * g -> n * d
+        # (d * n * 1) x (d * 1 * n) -> d * n * n
+        local_scores = q_local.transpose(-1, -2)[:, :, None] * k_local.transpose(-1, -2)[:, None, :] / x.shape[1] / x.shape[1]
+        local_scores.masked_fill_(~adj_matrix, -1e9)
+        local_scores = local_scores.transpose(-2, -3) # n * d * n
+        return local_scores
+
+    def score_global(self, x, masked_x=None, x_bar=None):
+        if masked_x is None:
+            masked_x = x
+        if x_bar is None:
+            x_bar = torch.mean(x, axis=0, keepdim=True)
+        q_global = self.q_global(masked_x) # n * g -> n * d
+        k_global = self.k_global(x_bar)    # m * g -> m * d
+        global_scores = q_global.transpose(-1, -2)[:, :, None] * k_global.transpose(-1, -2)[:, None, :] / x.shape[1] / x.shape[1]
+        global_scores = global_scores.transpose(-2, -3) # n * d * m
+        return global_scores
+
+    def forward(self, adj_matrix, x, masked_x=None, x_bar=None):
         if x_bar is None:
             x_bar = torch.mean(x, axis=0, keepdim=True) # in which case, m := 1
             # Note: x_bar can have multiple pseudobulks.
@@ -101,27 +123,13 @@ class BilinearAttention(nn.Module):
 
         # ego_scores = self.qk_ego(masked_x) / x.shape[1] 
         ego_scores = self.v_ego.rofward(masked_x) / x.shape[1] 
-        if superego:
-            max_ego_score, _ = torch.max(ego_scores, dim=1, keepdim=True)
-            ego_scores = torch.exp(ego_scores - max_ego_score)
-            ego_attn = ego_scores / torch.sum(ego_scores, dim=-1, keepdim=True)
-            return torch.exp(self.v_ego(ego_attn)), None, None
-        
-        q_local = self.q_local(masked_x) # n * g -> n * d
-        k_local = self.k_local(x) # n * g -> n * d
-        # (d * n * 1) x (d * 1 * n) -> d * n * n
-        local_scores = q_local.transpose(-1, -2)[:, :, None] * k_local.transpose(-1, -2)[:, None, :] / x.shape[1] / x.shape[1]
-        local_scores.masked_fill_(~adj_matrix, -1e9)
-        local_scores = local_scores.transpose(-2, -3) # n * d * n
 
+        local_scores = self.score_local(adj_matrix, x, masked_x)
         max_local_score, _ = torch.max(local_scores.reshape((local_scores.shape[0], -1)), dim=1, keepdim=True)
         max_ego_score, _ = torch.max(ego_scores, dim=1, keepdim=True)
 
         if self.d_global > 0:
-            q_global = self.q_global(masked_x) # n * g -> n * d
-            k_global = self.k_global(x_bar)    # m * g -> m * d
-            global_scores = q_global.transpose(-1, -2)[:, :, None] * k_global.transpose(-1, -2)[:, None, :] / x.shape[1] / x.shape[1]
-            global_scores = global_scores.transpose(-2, -3) # n * d * m
+            global_scores = self.score_global(x, masked_x, x_bar)
             max_score, _ = torch.max(torch.cat([global_scores.reshape((global_scores.shape[0], -1)), 
                                                 max_ego_score, 
                                                 max_local_score], dim=1), dim=1, keepdim=True)
@@ -188,9 +196,9 @@ class SpaceFormer(nn.Module):
 
         return out_x
 
-    def forward(self, adj_matrix, x, masked_x, get_details=False, superego=False):
+    def forward(self, adj_matrix, x, masked_x, get_details=False):
         # Spatial component
-        z, sub_res, attn = self.spatial_gather(adj_matrix, x, masked_x, superego=superego)
+        z, sub_res, attn = self.spatial_gather(adj_matrix, x, masked_x)
 
         # Max pooling with the input
         # x_recon = torch.maximum(z, masked_x)
@@ -271,7 +279,8 @@ class SpaceFormer(nn.Module):
             # scheduler.step()
         else:
             logger.info(f"Maximum iterations reached.")
-
+        
+        self.eval()
         return self
 
     def transform(self, x, adj_matrix):
@@ -363,4 +372,10 @@ class SpaceFormer(nn.Module):
                 res[f'V_global_{i}'] = features[np.argsort(-v_global[i, :])[:top_k]].tolist()
         return res
     
+    def score_local(self, x, adj_matrix):
+        with torch.no_grad():
+            return self.spatial_gather.score_local(x, adj_matrix).cpu().numpy()
     
+    def score_global(self, x, x_bar=None):
+        with torch.no_grad():
+            return self.spatial_gather.score_global(x, x_bar=x_bar).cpu().numpy()
