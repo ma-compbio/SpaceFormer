@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader
 from .utils import _sce_loss, _get_logger
 from tensorboardX import SummaryWriter
 from functools import partial
-from .dataset import _SpaceFormerDataset
+from .dataset import SpaceFormerDataset
 import os
 from typing import Literal
 
@@ -102,6 +102,18 @@ class BilinearAttention(nn.Module):
         local_scores = local_scores.transpose(-2, -3) # n * d * n
         return local_scores
 
+    def score_local_sparse(self, adj_list, x, masked_x=None):
+        if masked_x is None:
+            masked_x = x
+        q_local = self.q_local(masked_x) # n * g -> n * d
+        k_local = self.k_local(x) # n * g -> n * d
+        q_local = q_local[adj_list[1, :], :] # n * g -> kn * d
+        k_local = k_local[adj_list[0, :], :] # n * g -> kn * d
+        local_scores = (q_local * k_local) # nk * d
+        local_scores = local_scores.reshape([x.shape[0], -1, self.d_local]) # n * k * d
+        local_scores = local_scores.transpose(-1, -2)
+        return local_scores
+
     def score_global(self, x, masked_x=None, x_bar=None):
         if masked_x is None:
             masked_x = x
@@ -113,7 +125,7 @@ class BilinearAttention(nn.Module):
         global_scores = global_scores.transpose(-2, -3) # n * d * m
         return global_scores
 
-    def forward(self, adj_matrix, x, masked_x=None, x_bar=None):
+    def forward(self, adj_matrix, x, masked_x=None, x_bar=None, sparse_graph=False):
         if x_bar is None:
             x_bar = torch.mean(x, axis=0, keepdim=True) # in which case, m := 1
             # Note: x_bar can have multiple pseudobulks.
@@ -124,7 +136,11 @@ class BilinearAttention(nn.Module):
         # ego_scores = self.qk_ego(masked_x) / x.shape[1] 
         ego_scores = self.v_ego.rofward(masked_x) / x.shape[1] 
 
-        local_scores = self.score_local(adj_matrix, x, masked_x)
+        if sparse_graph:
+            local_scores = self.score_local_sparse(adj_matrix, x, masked_x)
+        else:
+            local_scores = self.score_local(adj_matrix, x, masked_x)
+        # print(local_scores.shape)
         max_local_score, _ = torch.max(local_scores.reshape((local_scores.shape[0], -1)), dim=1, keepdim=True)
         max_ego_score, _ = torch.max(ego_scores, dim=1, keepdim=True)
 
@@ -137,6 +153,7 @@ class BilinearAttention(nn.Module):
             max_score, _ = torch.max(torch.cat([max_ego_score, max_local_score], dim=1), dim=1, keepdim=True)
 
         ego_scores = torch.exp(ego_scores - max_score)
+
         local_scores = torch.exp(local_scores - max_score[:, :, None])
         local_scores = torch.sum(local_scores, dim=-1)
 
@@ -196,9 +213,9 @@ class SpaceFormer(nn.Module):
 
         return out_x
 
-    def forward(self, adj_matrix, x, masked_x, get_details=False):
+    def forward(self, adj_matrix, x, masked_x, sparse_graph=False, get_details=False):
         # Spatial component
-        z, sub_res, attn = self.spatial_gather(adj_matrix, x, masked_x)
+        z, sub_res, attn = self.spatial_gather(adj_matrix, x, masked_x, sparse_graph=sparse_graph)
 
         # Max pooling with the input
         # x_recon = torch.maximum(z, masked_x)
@@ -209,7 +226,7 @@ class SpaceFormer(nn.Module):
         else:
             return x_recon
 
-    def fit(self, dataset: _SpaceFormerDataset, masking_rate=0.0, device:str='cuda', optim_type:str='adam', *, lr:float=1e-4, weight_decay:float=0., 
+    def fit(self, dataset: SpaceFormerDataset, masking_rate=0.0, device:str='cuda', optim_type:str='adam', *, lr:float=1e-4, weight_decay:float=0., 
             warmup=8, max_epoch:int=100, stop_eps=1e-3, stop_tol=3, loss_fn:str='mse', log_dir:str='log/'):
         """Create a PyTorch Dataset from a list of adata
 
@@ -255,10 +272,10 @@ class SpaceFormer(nn.Module):
         for epoch in range(max_epoch):
             total_loss = 0
             for x, adj_matrix in loader:
-                x = x.to(device).squeeze(0)
-                adj_matrix = adj_matrix.to(device).squeeze(0)
+                x = x.squeeze(0).to(device)
+                adj_matrix = adj_matrix.squeeze(0).to(device)
                 masked_x = self.masking(x, masking_rate)
-                x_recon = self(adj_matrix, x, masked_x)
+                x_recon = self(adj_matrix, x, masked_x, sparse_graph=dataset.sparse_graph)
                 
                 loss = criterion(x, x_recon)
                 total_loss += loss.item()

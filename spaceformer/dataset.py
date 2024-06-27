@@ -62,8 +62,9 @@ def make_dataset(adatas: list[sc.AnnData], sparse_graph=False) -> Dataset:
             u = u.reshape([-1, k])
             if not (v == np.arange(adata.shape[0])[:, None]).all():
                 raise ValueError("Sparse graph only supports k-NN graph where each node has exactly k neighbors.")
-            
-            data_dict['adj'] = torch.from_numpy(u)
+            u = u.flatten()
+            v = v.flatten()
+            data_dict['adj'] = torch.from_numpy(np.vstack([u, v]))
 
         else:
             data_dict['adj'] = torch.from_numpy((adata.obsp['spatial_connectivities'] == 1).toarray())
