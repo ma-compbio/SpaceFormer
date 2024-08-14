@@ -20,12 +20,13 @@ class SpaceFormerDataset(Dataset):
         return sample['X'], sample['adj']
     
 
-def prep_adatas(adatas: list[sc.AnnData], n_neighs: int = 8) -> list[sc.AnnData]:
+def prep_adatas(adatas: list[sc.AnnData], n_neighs: int = 8, log_norm=True) -> list[sc.AnnData]:
     for i in tqdm(range(len(adatas))):
         adata = adatas[i]
-        sc.pp.normalize_total(adata)
-        sc.pp.log1p(adata)
-        sc.pp.scale(adata, zero_center=False)
+        if log_norm:
+            sc.pp.normalize_total(adata)
+            sc.pp.log1p(adata)
+        # sc.pp.scale(adata, zero_center=False)
         sq.gr.spatial_neighbors(adata, n_neighs=n_neighs)
     return adatas
 
@@ -62,9 +63,8 @@ def make_dataset(adatas: list[sc.AnnData], sparse_graph=False) -> Dataset:
             u = u.reshape([-1, k])
             if not (v == np.arange(adata.shape[0])[:, None]).all():
                 raise ValueError("Sparse graph only supports k-NN graph where each node has exactly k neighbors.")
-            u = u.flatten()
-            v = v.flatten()
-            data_dict['adj'] = torch.from_numpy(np.vstack([u, v]))
+
+            data_dict['adj'] = torch.from_numpy(np.vstack([u.flatten(), v.flatten()]))
 
         else:
             data_dict['adj'] = torch.from_numpy((adata.obsp['spatial_connectivities'] == 1).toarray())

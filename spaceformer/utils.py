@@ -12,6 +12,8 @@ from torch import optim as optim
 
 def _get_logger(name, log_dir=None):
     logger = logging.getLogger(name)
+    if (logger.hasHandlers()):
+        logger.handlers.clear()
     logger.setLevel(logging.DEBUG)
     formatter = logging.Formatter('[%(asctime)s::%(name)s::%(levelname)s] %(message)s')
 

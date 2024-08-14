@@ -14,7 +14,7 @@ from typing import Literal
 class NonNegLinear(nn.Module):
     def __init__(self, d_in, d_out, bias) -> None:
         super().__init__()
-        self._weight = torch.nn.Parameter(torch.randn(d_out, d_in) - 3)
+        self._weight = torch.nn.Parameter(torch.rand(d_out, d_in) - 2)
         self.elu = nn.ELU()
         if bias:
             raise NotImplementedError()
@@ -26,11 +26,25 @@ class NonNegLinear(nn.Module):
     def forward(self, x):
         return x @ self.weight.T
 
-class NonNegLinear2(nn.Module):
+class ReverseNonNegLinear:
+    def __init__(self, bnnl):
+        self.bnnl = bnnl
+    
+    @property
+    def weight(self):
+        return self.bnnl.thgiew
+
+    def forward(self, x):
+        return self.bnnl.rofward(x)
+    
+    def __call__(self, x):
+        return self.forward(x)
+
+class BidirNonNegLinear(nn.Module):
     def __init__(self, d_in, d_out, bias) -> None:
         super().__init__()
-        self._weight = torch.nn.Parameter(torch.randn(d_out, d_in) - 3)
-        self.shift = torch.nn.Parameter(torch.randn(1))
+        self._weight = torch.nn.Parameter(torch.rand(d_out, d_in) - 2)
+        self._shift = torch.nn.Parameter(torch.zeros(1, d_in))
         self.elu = nn.ELU()
         if bias:
             raise NotImplementedError()
@@ -38,17 +52,17 @@ class NonNegLinear2(nn.Module):
     @property
     def weight(self):
         return self.elu(self._weight) + 1
-    
+
     @property
-    def weight2(self):
-        return self.weight + self.shift
+    def thgiew(self):
+        return self.elu(self._weight + self._shift) + 1
 
     def forward(self, x):
         return x @ self.weight.T
     
     def rofward(self, x):
-        return x @ self.weight2
-
+        return x @ self.thgiew
+    
 class NonNegBias(nn.Module):
     def __init__(self, d) -> None:
         super().__init__()
@@ -76,25 +90,29 @@ class BilinearAttention(nn.Module):
         self.bias = NonNegBias(d_out)
 
         # self.qk_ego = nn.Linear(d_in, d_ego, bias=False)
-        self.v_ego = NonNegLinear2(d_ego, d_out, bias=False)
+        self.v_ego = BidirNonNegLinear(d_ego, d_out, bias=False)
 
-        self.q_local = nn.Linear(d_in, d_local, bias=False)
+        self.q_local = NonNegLinear(d_in, d_local, bias=False)
         self.k_local = NonNegLinear(d_in, d_local, bias=False)
         self.v_local = NonNegLinear(d_local, d_out, bias=False)
 
-        if self.d_global > 0:
-            self.q_global = nn.Linear(d_in, d_global, bias=False)
-            self.k_global = NonNegLinear(d_in, d_global, bias=False)
-            self.v_global = NonNegLinear(d_global, d_out, bias=False)
-        else:
-            self.q_global = None
-            self.k_global = None
-            self.v_global = None
+        self.q_global = NonNegLinear(d_in, d_global, bias=False)
+        self.k_global = NonNegLinear(d_in, d_global, bias=False)
+        self.v_global = NonNegLinear(d_global, d_out, bias=False)
+
+    def othorgonality(self, m):
+        temp = m @ m.transpose(0, 1)
+        eye = torch.eye(m.shape[0]).to(m.get_device())
+        return (temp - eye).pow(2.0).sum()
+    
+    def q_othorgonality(self):
+        return self.othorgonality(self.q_local.weight) + self.othorgonality(self.q_global.weight) + self.othorgonality(self.v_ego.weight2.transpose(0, 1))
 
     def score_local(self, adj_matrix, x, masked_x=None):
         if masked_x is None:
             masked_x = x
-        q_local = self.q_local(masked_x) # n * g -> n * d
+        # q_local = self.v_local.rofward(masked_x) # n * g -> n * d
+        q_local = self.q_local(masked_x)
         k_local = self.k_local(x) # n * g -> n * d
         # (d * n * 1) x (d * 1 * n) -> d * n * n
         local_scores = q_local.transpose(-1, -2)[:, :, None] * k_local.transpose(-1, -2)[:, None, :] / x.shape[1] / x.shape[1]
@@ -105,12 +123,14 @@ class BilinearAttention(nn.Module):
     def score_local_sparse(self, adj_list, x, masked_x=None):
         if masked_x is None:
             masked_x = x
-        q_local = self.q_local(masked_x) # n * g -> n * d
+        # q_local = self.v_local.rofward(masked_x) # n * g -> n * d
+        q_local = self.q_local(masked_x)
         k_local = self.k_local(x) # n * g -> n * d
         q_local = q_local[adj_list[1, :], :] # n * g -> kn * d
         k_local = k_local[adj_list[0, :], :] # n * g -> kn * d
         local_scores = (q_local * k_local) # nk * d
-        local_scores = local_scores.reshape([x.shape[0], -1, self.d_local]) # n * k * d
+        n = local_scores.shape[0] // x.shape[0]
+        local_scores = local_scores.reshape([x.shape[0], n, self.d_local]) / x.shape[1] / x.shape[1] # n * k * d 
         local_scores = local_scores.transpose(-1, -2)
         return local_scores
 
@@ -119,7 +139,8 @@ class BilinearAttention(nn.Module):
             masked_x = x
         if x_bar is None:
             x_bar = torch.mean(x, axis=0, keepdim=True)
-        q_global = self.q_global(masked_x) # n * g -> n * d
+        # q_global = self.v_global.rofward(masked_x) # n * g -> n * d
+        q_global = self.q_global(masked_x)
         k_global = self.k_global(x_bar)    # m * g -> m * d
         global_scores = q_global.transpose(-1, -2)[:, :, None] * k_global.transpose(-1, -2)[:, None, :] / x.shape[1] / x.shape[1]
         global_scores = global_scores.transpose(-2, -3) # n * d * m
@@ -140,50 +161,68 @@ class BilinearAttention(nn.Module):
             local_scores = self.score_local_sparse(adj_matrix, x, masked_x)
         else:
             local_scores = self.score_local(adj_matrix, x, masked_x)
-        # print(local_scores.shape)
-        max_local_score, _ = torch.max(local_scores.reshape((local_scores.shape[0], -1)), dim=1, keepdim=True)
-        max_ego_score, _ = torch.max(ego_scores, dim=1, keepdim=True)
 
+        global_scores = self.score_global(x, masked_x, x_bar)
+
+        max_list = []
+        if self.d_ego > 0:
+            max_ego_score, _ = torch.max(ego_scores, dim=1, keepdim=True)
+            max_list.append(max_ego_score)
+        if self.d_local > 0:
+            max_local_score, _ = torch.max(local_scores.reshape((local_scores.shape[0], -1)), dim=1, keepdim=True)
+            max_list.append(max_local_score)
         if self.d_global > 0:
-            global_scores = self.score_global(x, masked_x, x_bar)
-            max_score, _ = torch.max(torch.cat([global_scores.reshape((global_scores.shape[0], -1)), 
-                                                max_ego_score, 
-                                                max_local_score], dim=1), dim=1, keepdim=True)
-        else:
-            max_score, _ = torch.max(torch.cat([max_ego_score, max_local_score], dim=1), dim=1, keepdim=True)
-
-        ego_scores = torch.exp(ego_scores - max_score)
-
-        local_scores = torch.exp(local_scores - max_score[:, :, None])
-        local_scores = torch.sum(local_scores, dim=-1)
-
-        if self.d_global > 0:
-            global_scores = torch.exp(global_scores - max_score[:, :, None])
-            global_scores = torch.sum(global_scores, dim=-1)
-            sum_score = (torch.sum(ego_scores, dim=-1, keepdim=True) + 
-                        torch.sum(local_scores, dim=-1, keepdim=True) + 
-                        torch.sum(global_scores, dim=-1, keepdim=True))
-            global_attn = global_scores / sum_score
-            global_res = self.v_global(global_attn)
-        else:
-            sum_score = (torch.sum(ego_scores, dim=-1, keepdim=True) + 
-                        torch.sum(local_scores, dim=-1, keepdim=True))
-
-        ego_attn = ego_scores / sum_score
-        local_attn = local_scores / sum_score
-
-        ego_res = self.v_ego(ego_attn)
-        local_res = self.v_local(local_attn)
+            max_global_score, _ = torch.max(global_scores.reshape((global_scores.shape[0], -1)), dim=1, keepdim=True)
+            max_list.append(max_global_score)
         
+        max_score, _ = torch.max(torch.cat(max_list, dim=1), dim=1, keepdim=True)
+
+        sum_exp_score = 0.
+        if self.d_ego > 0:
+            exp_ego_scores = torch.exp(ego_scores - max_score)
+            sum_exp_score += torch.sum(exp_ego_scores, dim=-1, keepdim=True)
+        if self.d_local > 0:
+            exp_local_scores = torch.exp(local_scores - max_score[:, :, None])
+            exp_local_scores = torch.sum(exp_local_scores, dim=-1)
+            sum_exp_score += torch.sum(exp_local_scores, dim=-1, keepdim=True)
         if self.d_global > 0:
-            res = ego_res + local_res + global_res
+            exp_global_scores = torch.exp(global_scores - max_score[:, :, None])
+            exp_global_scores = torch.sum(exp_global_scores, dim=-1)
+            sum_exp_score += torch.sum(exp_global_scores, dim=-1, keepdim=True)
+
+        res = 0.
+        if self.d_ego > 0:
+            ego_attn = exp_ego_scores / sum_exp_score
+            ego_res = self.v_ego(ego_attn)
+            res += ego_res
         else:
-            res = ego_res + local_res
-            global_res = None
+            ego_scores = None
+            ego_attn = None
+            ego_res = None
+
+        if self.d_local > 0:
+            local_attn = exp_local_scores / sum_exp_score
+            local_res = self.v_local(local_attn)
+            res += local_res
+        else:
+            local_scores = None
+            local_attn = None
+            local_res = None
+
+        if self.d_global > 0:
+            global_attn = exp_global_scores / sum_exp_score
+            global_res = self.v_global(global_attn)
+            res += global_res
+        else:
+            global_scores = None
             global_attn = None
+            global_res = None
 
         res = self.bias(res)
-        return res, (ego_res, local_res, global_res), (ego_attn, local_attn, global_attn)
+        return (res, 
+                (ego_res, local_res, global_res), 
+                (ego_attn, local_attn, global_attn), 
+                (ego_scores, local_scores, global_scores))
 
     
 class SpaceFormer(nn.Module):
@@ -215,19 +254,19 @@ class SpaceFormer(nn.Module):
 
     def forward(self, adj_matrix, x, masked_x, sparse_graph=False, get_details=False):
         # Spatial component
-        z, sub_res, attn = self.spatial_gather(adj_matrix, x, masked_x, sparse_graph=sparse_graph)
+        z, sub_res, attn, unnorm_attn = self.spatial_gather(adj_matrix, x, masked_x, sparse_graph=sparse_graph)
 
         # Max pooling with the input
         # x_recon = torch.maximum(z, masked_x)
         x_recon = z
 
         if get_details:
-            return x_recon, sub_res, attn
+            return x_recon, sub_res, attn, unnorm_attn
         else:
             return x_recon
 
     def fit(self, dataset: SpaceFormerDataset, masking_rate=0.0, device:str='cuda', optim_type:str='adam', *, lr:float=1e-4, weight_decay:float=0., 
-            warmup=8, max_epoch:int=100, stop_eps=1e-3, stop_tol=3, loss_fn:str='mse', log_dir:str='log/'):
+            warmup=8, max_epoch:int=100, stop_eps=1e-4, stop_tol=10, loss_fn:str='mse', log_dir:str='log/', orthogonal=0., report_per=5):
         """Create a PyTorch Dataset from a list of adata
 
         :param dataset: Dataset to be trained on
@@ -268,7 +307,7 @@ class SpaceFormer(nn.Module):
         # writer = SummaryWriter(logdir=log_dir)
 
         cnt = 0
-        last_avg_loss = np.inf
+        best_loss = np.inf
         for epoch in range(max_epoch):
             total_loss = 0
             for x, adj_matrix in loader:
@@ -280,23 +319,37 @@ class SpaceFormer(nn.Module):
                 loss = criterion(x, x_recon)
                 total_loss += loss.item()
 
+                loss = loss * x.shape[0] / 10000
+
+                if orthogonal > 0.:
+                    reg = self.spatial_gather.q_othorgonality() * orthogonal
+                else:
+                    reg = 0.
+
                 optimizer.zero_grad()
-                loss.backward()
+                (loss + reg).backward()
                 optimizer.step()
 
             avg_loss = total_loss / len(loader)
-            logger.info(f"Epoch {epoch + 1}: train_loss {avg_loss:.5f}")
-            if last_avg_loss - avg_loss < stop_eps:
+
+            if best_loss - avg_loss < stop_eps:
                 cnt += 1
+            else:
+                cnt = 0
             if cnt >= stop_tol:
+                logger.info(f"Epoch {epoch + 1}: train_loss {avg_loss:.4f}")
                 logger.info(f"Stopping criterion met.")
                 break
+            elif (epoch % report_per) == 0:
+                logger.info(f"Epoch {epoch + 1}: train_loss {avg_loss:.4f}")
+            best_loss = min(best_loss, avg_loss)
+
             # writer.add_scalar('Train_Loss', train_loss / len(loader), epoch)
             # writer.add_scalar('Learning_Rate', optimizer.state_dict()["param_groups"][0]["lr"], epoch)
             # scheduler.step()
         else:
             logger.info(f"Maximum iterations reached.")
-        
+        self.fit_loss = avg_loss
         self.eval()
         return self
 
@@ -308,8 +361,7 @@ class SpaceFormer(nn.Module):
             if not isinstance(adj_matrix, torch.Tensor):
                 adj_matrix = torch.BoolTensor(adj_matrix)
             
-            res, (ego_res, local_res, global_res), (ego_attn, local_attn, global_attn) = self(adj_matrix, x, get_details=True)
-            return res, (ego_res, local_res, global_res), (ego_attn, local_attn, global_attn)
+            return self(adj_matrix, x, get_details=True)
 
 
     def get_bias(self) -> np.array:
@@ -324,7 +376,7 @@ class SpaceFormer(nn.Module):
         :return: Gene attention vectors
         """
         # qk = self.spatial_gather.qk_ego.weight.detach().cpu().numpy()
-        qk = self.spatial_gather.v_ego.weight2.detach().cpu().numpy()
+        qk = self.spatial_gather.v_ego.thgiew.detach().cpu().numpy()
         v = self.spatial_gather.v_ego.weight.detach().cpu().numpy()
         return qk.T, v.T
 
