@@ -14,7 +14,7 @@ from typing import Literal
 class NonNegLinear(nn.Module):
     def __init__(self, d_in, d_out, bias) -> None:
         super().__init__()
-        self._weight = torch.nn.Parameter(torch.rand(d_out, d_in) - 2)
+        self._weight = torch.nn.Parameter(torch.rand(d_out, d_in) / 10 - 2)
         self.elu = nn.ELU()
         if bias:
             raise NotImplementedError()
@@ -55,7 +55,7 @@ class BidirNonNegLinear(nn.Module):
 
     @property
     def thgiew(self):
-        return self.elu(self._weight + self._shift) + 1
+        return (self.elu(self._weight) + 1) * (self.elu(self._shift) + 1)
 
     def forward(self, x):
         return x @ self.weight.T
@@ -89,16 +89,36 @@ class BilinearAttention(nn.Module):
 
         self.bias = NonNegBias(d_out)
 
-        # self.qk_ego = nn.Linear(d_in, d_ego, bias=False)
+        self.qk_ego = nn.Linear(d_in, d_ego, bias=False)
         self.v_ego = BidirNonNegLinear(d_ego, d_out, bias=False)
 
-        self.q_local = NonNegLinear(d_in, d_local, bias=False)
-        self.k_local = NonNegLinear(d_in, d_local, bias=False)
-        self.v_local = NonNegLinear(d_local, d_out, bias=False)
+        self.q_local = NonNegLinear(d_in, d_local, bias=False) # each row of the weight matrix is a metagene (x -> x @ w.T)
+        self.k_local = NonNegLinear(d_in, d_local, bias=False) # each row ...
+        self.v_local = NonNegLinear(d_local, d_out, bias=False) # each column ..
 
-        self.q_global = NonNegLinear(d_in, d_global, bias=False)
-        self.k_global = NonNegLinear(d_in, d_global, bias=False)
-        self.v_global = NonNegLinear(d_global, d_out, bias=False)
+        self.q_global = NonNegLinear(d_in, d_global, bias=False) # each row ..
+        self.k_global = NonNegLinear(d_in, d_global, bias=False) # each row ..
+        self.v_global = NonNegLinear(d_global, d_out, bias=False) # each column ..
+
+        # penalty / regularlization
+        self.cos_sim = nn.CosineSimilarity(dim=1) # each row is a metagene
+        self.cell_cos_sim = nn.CosineSimilarity(dim=0) # each col is a list of cells
+        # remember some variables during forward
+        self.k_local_emb = None
+        self.q_local_emb = None
+
+    def local_cell_cos(self):
+        temp = self.cell_cos_sim(self.k_local_emb, self.q_local_emb).sum()
+        # self.k_local_emb = None
+        # self.q_local_emb = None
+        return temp
+
+    def local_cos(self):
+        return self.cos_sim(self.q_local.weight, self.v_local.weight.T).sum() # response v should be different from receiver q
+    
+    def global_cos(self):
+        return (self.cos_sim(self.q_global.weight, self.v_global.weight.T).sum() + # response v should be different from receiver q
+                self.cos_sim(self.q_global.weight, self.k_global.weight).sum())  
 
     def othorgonality(self, m):
         temp = m @ m.transpose(0, 1)
@@ -118,6 +138,8 @@ class BilinearAttention(nn.Module):
         local_scores = q_local.transpose(-1, -2)[:, :, None] * k_local.transpose(-1, -2)[:, None, :] / x.shape[1] / x.shape[1]
         local_scores.masked_fill_(~adj_matrix, -1e9)
         local_scores = local_scores.transpose(-2, -3) # n * d * n
+        self.k_local_emb = k_local
+        self.q_local_emb = q_local
         return local_scores
 
     def score_local_sparse(self, adj_list, x, masked_x=None):
@@ -126,9 +148,13 @@ class BilinearAttention(nn.Module):
         # q_local = self.v_local.rofward(masked_x) # n * g -> n * d
         q_local = self.q_local(masked_x)
         k_local = self.k_local(x) # n * g -> n * d
-        q_local = q_local[adj_list[1, :], :] # n * g -> kn * d
-        k_local = k_local[adj_list[0, :], :] # n * g -> kn * d
+        self.k_local_emb = k_local
+        self.q_local_emb = q_local
+        q_local = q_local[adj_list[1, :], :] # n * g --v-> kn * d
+        k_local = k_local[adj_list[0, :], :] # n * g --u-> kn * d
         local_scores = (q_local * k_local) # nk * d
+        if adj_list.shape[0] == 3: # masked for unequal neighbors
+            local_scores.masked_fill_((adj_list[2, :] == 0).reshape([-1, 1]), 0.)
         n = local_scores.shape[0] // x.shape[0]
         local_scores = local_scores.reshape([x.shape[0], n, self.d_local]) / x.shape[1] / x.shape[1] # n * k * d 
         local_scores = local_scores.transpose(-1, -2)
@@ -146,7 +172,7 @@ class BilinearAttention(nn.Module):
         global_scores = global_scores.transpose(-2, -3) # n * d * m
         return global_scores
 
-    def forward(self, adj_matrix, x, masked_x=None, x_bar=None, sparse_graph=False):
+    def forward(self, adj_matrix, x, masked_x=None, x_bar=None, sparse_graph=True):
         if x_bar is None:
             x_bar = torch.mean(x, axis=0, keepdim=True) # in which case, m := 1
             # Note: x_bar can have multiple pseudobulks.
@@ -154,8 +180,8 @@ class BilinearAttention(nn.Module):
         if masked_x is None:
             masked_x = x
 
-        # ego_scores = self.qk_ego(masked_x) / x.shape[1] 
-        ego_scores = self.v_ego.rofward(masked_x) / x.shape[1] 
+        ego_scores = (self.qk_ego(masked_x) / x.shape[1]) ** 2
+        # ego_scores = (self.v_ego.rofward(masked_x) / x.shape[1]) ** 2
 
         if sparse_graph:
             local_scores = self.score_local_sparse(adj_matrix, x, masked_x)
@@ -167,7 +193,7 @@ class BilinearAttention(nn.Module):
         max_list = []
         if self.d_ego > 0:
             max_ego_score, _ = torch.max(ego_scores, dim=1, keepdim=True)
-            max_list.append(max_ego_score)
+            # max_list.append(max_ego_score)
         if self.d_local > 0:
             max_local_score, _ = torch.max(local_scores.reshape((local_scores.shape[0], -1)), dim=1, keepdim=True)
             max_list.append(max_local_score)
@@ -177,19 +203,21 @@ class BilinearAttention(nn.Module):
         
         max_score, _ = torch.max(torch.cat(max_list, dim=1), dim=1, keepdim=True)
 
-        sum_exp_score = 0.
+        sum_exp_score = 1e-3
         if self.d_ego > 0:
-            exp_ego_scores = torch.exp(ego_scores - max_score)
+            exp_ego_scores = ego_scores # torch.exp(ego_scores - max_score)
             sum_exp_score += torch.sum(exp_ego_scores, dim=-1, keepdim=True)
         if self.d_local > 0:
-            exp_local_scores = torch.exp(local_scores - max_score[:, :, None])
+            exp_local_scores = local_scores # torch.exp(local_scores - max_score[:, :, None])
             exp_local_scores = torch.sum(exp_local_scores, dim=-1)
             sum_exp_score += torch.sum(exp_local_scores, dim=-1, keepdim=True)
         if self.d_global > 0:
-            exp_global_scores = torch.exp(global_scores - max_score[:, :, None])
+            exp_global_scores = global_scores # torch.exp(global_scores - max_score[:, :, None])
             exp_global_scores = torch.sum(exp_global_scores, dim=-1)
             sum_exp_score += torch.sum(exp_global_scores, dim=-1, keepdim=True)
 
+        # print(local_scores.shape, exp_local_scores.shape, sum_exp_score.shape)
+        # print(global_scores.shape, exp_global_scores.shape, sum_exp_score.shape)
         res = 0.
         if self.d_ego > 0:
             ego_attn = exp_ego_scores / sum_exp_score
@@ -201,20 +229,22 @@ class BilinearAttention(nn.Module):
             ego_res = None
 
         if self.d_local > 0:
+            local_norm_attn = local_scores / sum_exp_score[:, :, None]
             local_attn = exp_local_scores / sum_exp_score
             local_res = self.v_local(local_attn)
             res += local_res
         else:
-            local_scores = None
+            local_norm_attn = None
             local_attn = None
             local_res = None
 
         if self.d_global > 0:
+            global_norm_attn = global_scores / sum_exp_score[:, :, None]
             global_attn = exp_global_scores / sum_exp_score
             global_res = self.v_global(global_attn)
             res += global_res
         else:
-            global_scores = None
+            global_norm_attn = None
             global_attn = None
             global_res = None
 
@@ -222,7 +252,7 @@ class BilinearAttention(nn.Module):
         return (res, 
                 (ego_res, local_res, global_res), 
                 (ego_attn, local_attn, global_attn), 
-                (ego_scores, local_scores, global_scores))
+                (ego_attn, local_norm_attn, global_norm_attn))
 
     
 class SpaceFormer(nn.Module):
@@ -252,7 +282,7 @@ class SpaceFormer(nn.Module):
 
         return out_x
 
-    def forward(self, adj_matrix, x, masked_x, sparse_graph=False, get_details=False):
+    def forward(self, adj_matrix, x, masked_x, sparse_graph=True, get_details=False):
         # Spatial component
         z, sub_res, attn, unnorm_attn = self.spatial_gather(adj_matrix, x, masked_x, sparse_graph=sparse_graph)
 
@@ -265,8 +295,10 @@ class SpaceFormer(nn.Module):
         else:
             return x_recon
 
-    def fit(self, dataset: SpaceFormerDataset, masking_rate=0.0, device:str='cuda', optim_type:str='adam', *, lr:float=1e-4, weight_decay:float=0., 
-            warmup=8, max_epoch:int=100, stop_eps=1e-4, stop_tol=10, loss_fn:str='mse', log_dir:str='log/', orthogonal=0., report_per=5):
+    def fit(self, dataset: SpaceFormerDataset, masking_rate=0.0, device:str='cuda', 
+            *, orthogonal=0., similarity_penalty=0.0, 
+            opt=None, opt_args=None, max_epoch:int=100, stop_eps=1e-4, stop_tol=10, 
+            loss_fn:str='mse', log_dir:str='log/', report_per=10):
         """Create a PyTorch Dataset from a list of adata
 
         :param dataset: Dataset to be trained on
@@ -278,6 +310,7 @@ class SpaceFormer(nn.Module):
         :param max_epoch: maximum number of epochs
         :param loss_fn: Loss function for training
         :param log_dir: Directory to save logs
+        :param log_dir: report per how many epoch. 0 to only report before termination. negative number to never report.
 
         :return: A `torch.Dataset` including all data.
         """
@@ -285,13 +318,14 @@ class SpaceFormer(nn.Module):
 
         loader = DataLoader(dataset, batch_size=1, shuffle=True)
         parameters = self.parameters()
-        opt_args = dict(lr=lr, weight_decay=weight_decay)
 
-        if optim_type == "adam":
+        if opt_args is None:
+            opt_args = {}
+
+        if opt is None:
             optimizer = optim.Adam(parameters, **opt_args)
-        elif optim_type == 'SGD':
-            optimizer = optim.SGD(parameters, **opt_args)
-
+        else:
+            optimizer = opt(parameters, **opt_args)
         # scheduler = lambda epoch :( 1 + np.cos((epoch - warmup) * np.pi / (max_epoch - warmup)) ) * 0.5 if epoch >= warmup else (epoch / warmup)
         # scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=scheduler)
         
@@ -309,7 +343,8 @@ class SpaceFormer(nn.Module):
         cnt = 0
         best_loss = np.inf
         for epoch in range(max_epoch):
-            total_loss = 0
+            total_loss = 0.
+            total_penalty = 0.
             for x, adj_matrix in loader:
                 x = x.squeeze(0).to(device)
                 adj_matrix = adj_matrix.squeeze(0).to(device)
@@ -319,30 +354,33 @@ class SpaceFormer(nn.Module):
                 loss = criterion(x, x_recon)
                 total_loss += loss.item()
 
-                loss = loss * x.shape[0] / 10000
+                loss = loss # * x.shape[0] / 10000 # handle size differences among datasets; larger dataset has higher weight
 
+                reg = 0.
                 if orthogonal > 0.:
-                    reg = self.spatial_gather.q_othorgonality() * orthogonal
-                else:
-                    reg = 0.
-
+                    reg = self.spatial_gather.q_othorgonality() * orthogonal + reg
+                if similarity_penalty > 0.:
+                    reg = (self.spatial_gather.global_cos() + self.spatial_gather.local_cos() + self.spatial_gather.local_cell_cos()) * similarity_penalty + reg
+                if reg != 0.:
+                    total_penalty += reg.item()
                 optimizer.zero_grad()
                 (loss + reg).backward()
                 optimizer.step()
 
             avg_loss = total_loss / len(loader)
+            avg_penalty = total_penalty / len(loader)
 
-            if best_loss - avg_loss < stop_eps:
+            if best_loss - (avg_loss + avg_penalty) < stop_eps:
                 cnt += 1
             else:
                 cnt = 0
-            if cnt >= stop_tol:
-                logger.info(f"Epoch {epoch + 1}: train_loss {avg_loss:.4f}")
+            if report_per >= 0 and cnt >= stop_tol:
+                logger.info(f"Epoch {epoch + 1}: train_loss {avg_loss:.5f}, reg {avg_penalty:.6f}")
                 logger.info(f"Stopping criterion met.")
                 break
-            elif (epoch % report_per) == 0:
-                logger.info(f"Epoch {epoch + 1}: train_loss {avg_loss:.4f}")
-            best_loss = min(best_loss, avg_loss)
+            elif report_per > 0 and (epoch % report_per) == 0:
+                logger.info(f"Epoch {epoch + 1}: train_loss {avg_loss:.5f}, reg {avg_penalty:.6f}")
+            best_loss = min(best_loss, avg_loss + avg_penalty)
 
             # writer.add_scalar('Train_Loss', train_loss / len(loader), epoch)
             # writer.add_scalar('Learning_Rate', optimizer.state_dict()["param_groups"][0]["lr"], epoch)
@@ -376,9 +414,9 @@ class SpaceFormer(nn.Module):
         :return: Gene attention vectors
         """
         # qk = self.spatial_gather.qk_ego.weight.detach().cpu().numpy()
-        qk = self.spatial_gather.v_ego.thgiew.detach().cpu().numpy()
+        qk = self.spatial_gather.qk_ego.weight.detach().cpu().numpy()
         v = self.spatial_gather.v_ego.weight.detach().cpu().numpy()
-        return qk.T, v.T
+        return qk, v.T
 
     def get_local_transform(self) -> np.array:
         """Get gene attention matrix
