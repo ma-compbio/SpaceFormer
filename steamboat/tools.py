@@ -203,6 +203,62 @@ def plot_transforms(model: Steamboat, top: int = 3, reorder: bool = False,
             fig.add_artist(line)
 
 
+def plot_transform(model, scope, d, 
+                   top: int = 3, reorder: bool = False, 
+                   figsize: str | tuple[float, float] = 'auto'):
+    if scope == 'ego':
+        qk_ego, v_ego = model.get_ego_transform()
+        assert False, "Not implemented for ego."
+    elif scope == 'local':
+        q, k, v = model.get_local_transform()
+    elif scope == 'global':
+        q, k, v = model.get_global_transform()
+    else:
+        assert False, "scope must be local or global."
+
+    q = q[d, :]
+    k = k[d, :]
+    v = v[d, :]
+    
+    if top > 0:
+        rank_q = np.argsort(-q)[:top]
+        rank_k = np.argsort(-k)[:top]
+        rank_v = np.argsort(-v)[:top]
+        feature_mask = {}
+        for j in rank_k:
+            feature_mask[j] = None
+        for j in rank_q:
+            feature_mask[j] = None
+        for j in rank_v:
+            feature_mask[j] = None
+        feature_mask = list(feature_mask.keys())
+        chosen_features = np.array(model.features)[feature_mask]
+    else:
+        feature_mask = list(range(len(model.features)))
+        chosen_features = np.array(model.features)
+
+    if figsize == 'auto':
+        figsize = (.65, len(chosen_features) * 0.15 + .75)
+    # print(figsize)
+    fig, ax = plt.subplots(figsize=figsize)
+    common_params = {'linewidths': .05, 'linecolor': 'gray', 'yticklabels': chosen_features, 
+                     'cmap': 'Reds'}
+
+    to_plot = np.vstack((k[feature_mask],
+                         q[feature_mask],
+                         v[feature_mask])).T
+    true_vmax = to_plot.max(axis=0)
+    # print(true_vmax)
+    to_plot /= true_vmax
+
+    sns.heatmap(to_plot, xticklabels=['k', 'q', 'v'], ax=ax, **common_params)
+    
+    # ax.set_xticklabels(plot_axes[i].get_xticklabels(), rotation=0)
+    # ax.get_yaxis().set_visible(False)
+
+    plt.tight_layout()
+    
+
 def plot_transforms_combined(model, top=3, reorder=False, figsize='auto'):
     d_ego = model.spatial_gather.d_ego
     d_loc = model.spatial_gather.d_local
