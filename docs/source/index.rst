@@ -1,12 +1,12 @@
-.. SpaceFormer documentation master file, created by
+.. Steamboat documentation master file, created by
    sphinx-quickstart on Mon Apr  1 22:55:30 2024.
    You can adapt this file completely to your liking, but it should at least
    contain the root `toctree` directive.
 
-Welcome to SpaceFormer's documentation!
+Welcome to Steamboat's documentation!
 =======================================
 
-SpaceFormer is a transformer based computational tool to decipher short- and long-distance cellular interactions. 
+Steamboat is a transformer based computational tool to decipher short- and long-distance cellular interactions. 
 
 Functions:
 * Training a model on a set of spatial omics samples
@@ -19,7 +19,7 @@ Functions:
    
    installation
    tutorials
-   spaceformer/modules
+   Steamboat/modules
    contact
 
 

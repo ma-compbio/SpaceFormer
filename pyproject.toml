@@ -3,7 +3,7 @@ requires = ["setuptools >= 61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "spaceformer"
+name = "steamboat"
 version = "0.0.1"
 authors = [
   {name="Guanghan Wang", email="author@example.com"},
@@ -29,8 +29,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/ma-compbio/SpaceFormer"
-Issues = "https://github.com/ma-compbio/SpaceFormer/issues"
+Homepage = "https://github.com/ma-compbio/Steamboat"
+Issues = "https://github.com/ma-compbio/Steamboat/issues"
 
 [tool.setuptools]
-py-modules = ["spaceformer"]
+py-modules = ["steamboat"]

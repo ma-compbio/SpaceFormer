@@ -1,30 +1,30 @@
-SpaceFormer API
+Steamboat API
 ===============
 
 Submodules
 ----------
 
 
-spaceformer.dataset module
+steamboat.dataset module
 --------------------------
 
-.. automodule:: spaceformer.dataset
+.. automodule:: steamboat.dataset
    :members:
    :undoc-members:
    :show-inheritance:
 
-spaceformer.model module
+steamboat.model module
 ------------------------
 
-.. automodule:: spaceformer.model
+.. automodule:: steamboat.model
    :members:
    :undoc-members:
    :show-inheritance:
 
-spaceformer.utils module
+steamboat.utils module
 ------------------------
 
-.. automodule:: spaceformer.utils
+.. automodule:: steamboat.utils
    :members:
    :undoc-members:
    :show-inheritance:
@@ -32,7 +32,7 @@ spaceformer.utils module
 Module contents
 ---------------
 
-.. automodule:: spaceformer
+.. automodule:: steamboat
    :members:
    :undoc-members:
    :show-inheritance:
