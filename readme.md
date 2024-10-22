@@ -1,8 +1,8 @@
-# SpaceFormer
+# Steamboat
 
 [![Documentation Status](https://readthedocs.org/projects/spaceformer/badge/?version=latest)](https://spaceformer.readthedocs.io/en/latest/?badge=latest)
 
-SpaceFormer is a transformer based computational tool to decipher short- and long-distance cellular interactions. 
+Steamboat is a computational model to decipher short- and long-distance cellular interactions based on the multi-head attention mechanism. 
 
 Functions:
 - Training a model on a set of spatial omics samples
