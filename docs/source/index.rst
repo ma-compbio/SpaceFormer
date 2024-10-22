@@ -19,7 +19,7 @@ Functions:
    
    installation
    tutorials
-   Steamboat/modules
+   steamboat/modules
    contact
 
 

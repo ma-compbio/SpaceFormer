@@ -9,3 +9,14 @@
 [2024-10-22 18:50:07,983::train::INFO] Epoch 1601: train_loss 0.23574, reg 0.000000
 [2024-10-22 18:50:08,481::train::INFO] Epoch 1700: train_loss 0.27959, reg 0.000000
 [2024-10-22 18:50:08,482::train::INFO] Stopping criterion met.
+[2024-10-22 18:50:08,492::train::INFO] Epoch 1: train_loss 0.22921, reg 0.000000
+[2024-10-22 18:50:08,757::train::INFO] Epoch 51: train_loss 0.17126, reg 0.000000
+[2024-10-22 18:50:09,030::train::INFO] Epoch 101: train_loss 0.16714, reg 0.000000
+[2024-10-22 18:50:09,283::train::INFO] Epoch 151: train_loss 0.12901, reg 0.000000
+[2024-10-22 18:50:09,533::train::INFO] Epoch 201: train_loss 0.11218, reg 0.000000
+[2024-10-22 18:50:09,780::train::INFO] Epoch 251: train_loss 0.64120, reg 0.000000
+[2024-10-22 18:50:10,079::train::INFO] Epoch 301: train_loss 0.21049, reg 0.000000
+[2024-10-22 18:50:10,326::train::INFO] Epoch 351: train_loss 0.12099, reg 0.000000
+[2024-10-22 18:50:10,539::train::INFO] Epoch 401: train_loss 0.15703, reg 0.000000
+[2024-10-22 18:50:10,650::train::INFO] Epoch 423: train_loss 0.15196, reg 0.000000
+[2024-10-22 18:50:10,651::train::INFO] Stopping criterion met.
