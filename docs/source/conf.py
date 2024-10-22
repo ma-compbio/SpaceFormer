@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.abspath('../../notebooks'))
 
 # -- Project information -----------------------------------------------------
 
-project = 'SpaceFormer'
+project = 'Steamboat'
 copyright = '2024, Guanghan Wang, Shaoheng Liang, Jian Ma'
 author = 'Guanghan Wang, Shaoheng Liang, Jian Ma'
 
