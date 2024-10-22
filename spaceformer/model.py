@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader
 from .utils import _sce_loss, _get_logger
 from tensorboardX import SummaryWriter
 from functools import partial
-from .dataset import SpaceFormerDataset
+from .dataset import SteamboatDataset
 import os
 from typing import Literal
 
@@ -14,7 +14,7 @@ from typing import Literal
 class NonNegLinear(nn.Module):
     def __init__(self, d_in, d_out, bias) -> None:
         super().__init__()
-        self._weight = torch.nn.Parameter(torch.rand(d_out, d_in) / 10 - 2)
+        self._weight = torch.nn.Parameter(torch.randn(d_out, d_in) / 10 - 2)
         self.elu = nn.ELU()
         if bias:
             raise NotImplementedError()
@@ -22,6 +22,22 @@ class NonNegLinear(nn.Module):
     @property
     def weight(self):
         return self.elu(self._weight) + 1
+
+    def forward(self, x):
+        return x @ self.weight.T
+    
+class NormNonNegLinear(nn.Module):
+    def __init__(self, d_in, d_out, bias) -> None:
+        super().__init__()
+        self._weight = torch.nn.Parameter(torch.randn(d_out, d_in) / 10 - 2)
+        self.sigmoid = nn.Sigmoid()
+        if bias:
+            raise NotImplementedError()
+
+    @property
+    def weight(self):
+        temp =  self.sigmoid(self._weight)
+        return temp / temp.sum()
 
     def forward(self, x):
         return x @ self.weight.T
@@ -43,7 +59,7 @@ class ReverseNonNegLinear:
 class BidirNonNegLinear(nn.Module):
     def __init__(self, d_in, d_out, bias) -> None:
         super().__init__()
-        self._weight = torch.nn.Parameter(torch.rand(d_out, d_in) - 2)
+        self._weight = torch.nn.Parameter(torch.randn(d_out, d_in) - 2)
         self._shift = torch.nn.Parameter(torch.zeros(1, d_in))
         self.elu = nn.ELU()
         if bias:
@@ -92,11 +108,11 @@ class BilinearAttention(nn.Module):
         self.qk_ego = nn.Linear(d_in, d_ego, bias=False)
         self.v_ego = BidirNonNegLinear(d_ego, d_out, bias=False)
 
-        self.q_local = NonNegLinear(d_in, d_local, bias=False) # each row of the weight matrix is a metagene (x -> x @ w.T)
+        self.q_local = NormNonNegLinear(d_in, d_local, bias=False) # each row of the weight matrix is a metagene (x -> x @ w.T)
         self.k_local = NonNegLinear(d_in, d_local, bias=False) # each row ...
         self.v_local = NonNegLinear(d_local, d_out, bias=False) # each column ..
 
-        self.q_global = NonNegLinear(d_in, d_global, bias=False) # each row ..
+        self.q_global = NormNonNegLinear(d_in, d_global, bias=False) # each row ..
         self.k_global = NonNegLinear(d_in, d_global, bias=False) # each row ..
         self.v_global = NonNegLinear(d_global, d_out, bias=False) # each column ..
 
@@ -170,9 +186,11 @@ class BilinearAttention(nn.Module):
         k_global = self.k_global(x_bar)    # m * g -> m * d
         global_scores = q_global.transpose(-1, -2)[:, :, None] * k_global.transpose(-1, -2)[:, None, :] / x.shape[1] / x.shape[1]
         global_scores = global_scores.transpose(-2, -3) # n * d * m
+        self.k_global_emb = k_global
+        self.q_global_emb = q_global
         return global_scores
 
-    def forward(self, adj_matrix, x, masked_x=None, x_bar=None, sparse_graph=True):
+    def forward(self, adj_matrix, x, masked_x=None, x_bar=None, sparse_graph=True, get_details=False):
         if x_bar is None:
             x_bar = torch.mean(x, axis=0, keepdim=True) # in which case, m := 1
             # Note: x_bar can have multiple pseudobulks.
@@ -180,7 +198,8 @@ class BilinearAttention(nn.Module):
         if masked_x is None:
             masked_x = x
 
-        ego_scores = (self.qk_ego(masked_x) / x.shape[1]) ** 2
+        ego_emb = self.qk_ego(masked_x)
+        ego_scores = (ego_emb / x.shape[1]) ** 2
         # ego_scores = (self.v_ego.rofward(masked_x) / x.shape[1]) ** 2
 
         if sparse_graph:
@@ -229,7 +248,8 @@ class BilinearAttention(nn.Module):
             ego_res = None
 
         if self.d_local > 0:
-            local_norm_attn = local_scores / sum_exp_score[:, :, None]
+            if get_details:
+                local_norm_attn = local_scores / sum_exp_score[:, :, None]
             local_attn = exp_local_scores / sum_exp_score
             local_res = self.v_local(local_attn)
             res += local_res
@@ -239,7 +259,8 @@ class BilinearAttention(nn.Module):
             local_res = None
 
         if self.d_global > 0:
-            global_norm_attn = global_scores / sum_exp_score[:, :, None]
+            if get_details:
+                global_norm_attn = global_scores / sum_exp_score[:, :, None]
             global_attn = exp_global_scores / sum_exp_score
             global_res = self.v_global(global_attn)
             res += global_res
@@ -249,21 +270,27 @@ class BilinearAttention(nn.Module):
             global_res = None
 
         res = self.bias(res)
-        return (res, 
-                (ego_res, local_res, global_res), 
-                (ego_attn, local_attn, global_attn), 
-                (ego_attn, local_norm_attn, global_norm_attn))
+        if get_details:
+            return res, {
+                'embq': (ego_emb, self.q_local_emb, self.q_global_emb),
+                'embk': (None, self.k_local_emb, self.k_global_emb),
+                'attnp': (ego_attn, local_norm_attn, global_norm_attn),
+                'attnm': (ego_attn, local_attn, global_attn),
+                'trivia': (ego_res, local_res, global_res)}
+        else:
+            return res
+
 
     
-class SpaceFormer(nn.Module):
+class Steamboat(nn.Module):
     def __init__(self, features: list[str] | int, d_ego, d_local, d_global):
-        """SpaceFormer2 Model 
+        """Steamboat Model 
 
         :param features: input feature (gene) names or the number of features
         :param local_d: 
         :param global_d: 
         """
-        super(SpaceFormer, self).__init__()
+        super(Steamboat, self).__init__()
 
         if isinstance(features, list):
             self.features = features
@@ -274,28 +301,25 @@ class SpaceFormer(nn.Module):
         d_in = len(self.features)
         self.spatial_gather = BilinearAttention(d_in, d_ego, d_local, d_global, d_in)
 
-    def masking(self, x, mask_rate):
-        # All cells are masked
-        random_mask = torch.rand(x.shape, device=x.get_device()) < mask_rate
+    def masking(self, x, mask_rate, masking_method):
         out_x = x.clone()
-        out_x.masked_fill_(random_mask, 0.)
-
+        # All cells are masked
+        if masking_method == 'full':
+            random_mask = torch.rand(x.shape, device=x.get_device()) < mask_rate
+            out_x.masked_fill_(random_mask, 0.)
+        elif masking_method == 'feature':
+            random_mask = torch.rand([1, x.shape[1]], device=x.get_device()) < mask_rate
+            out_x.masked_fill_(random_mask, 0.)
+        else:
+            raise ValueError("Unknown random mask method.")
         return out_x
 
     def forward(self, adj_matrix, x, masked_x, sparse_graph=True, get_details=False):
-        # Spatial component
-        z, sub_res, attn, unnorm_attn = self.spatial_gather(adj_matrix, x, masked_x, sparse_graph=sparse_graph)
+        return self.spatial_gather(adj_matrix, x, masked_x, sparse_graph=sparse_graph, get_details=get_details)
 
-        # Max pooling with the input
-        # x_recon = torch.maximum(z, masked_x)
-        x_recon = z
-
-        if get_details:
-            return x_recon, sub_res, attn, unnorm_attn
-        else:
-            return x_recon
-
-    def fit(self, dataset: SpaceFormerDataset, masking_rate=0.0, device:str='cuda', 
+    def fit(self, dataset: SteamboatDataset, 
+            masking_rate=0.0, masking_method='full', 
+            device:str='cuda', 
             *, orthogonal=0., similarity_penalty=0.0, 
             opt=None, opt_args=None, max_epoch:int=100, stop_eps=1e-4, stop_tol=10, 
             loss_fn:str='mse', log_dir:str='log/', report_per=10):
@@ -348,7 +372,7 @@ class SpaceFormer(nn.Module):
             for x, adj_matrix in loader:
                 x = x.squeeze(0).to(device)
                 adj_matrix = adj_matrix.squeeze(0).to(device)
-                masked_x = self.masking(x, masking_rate)
+                masked_x = self.masking(x, masking_rate, masking_method)
                 x_recon = self(adj_matrix, x, masked_x, sparse_graph=dataset.sparse_graph)
                 
                 loss = criterion(x, x_recon)
@@ -360,7 +384,7 @@ class SpaceFormer(nn.Module):
                 if orthogonal > 0.:
                     reg = self.spatial_gather.q_othorgonality() * orthogonal + reg
                 if similarity_penalty > 0.:
-                    reg = (self.spatial_gather.global_cos() + self.spatial_gather.local_cos() + self.spatial_gather.local_cell_cos()) * similarity_penalty + reg
+                    reg = (self.spatial_gather.local_cos() + self.spatial_gather.local_cell_cos()) * similarity_penalty + reg
                 if reg != 0.:
                     total_penalty += reg.item()
                 optimizer.zero_grad()

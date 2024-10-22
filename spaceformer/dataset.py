@@ -7,8 +7,9 @@ from tqdm import tqdm
 import scipy as sp
 from typing import Union
 import scipy.sparse
+import warnings
 
-class SpaceFormerDataset(Dataset):
+class SteamboatDataset(Dataset):
     def __init__(self, data_list, sparse_graph):
         super().__init__()
         self.data = data_list
@@ -23,14 +24,17 @@ class SpaceFormerDataset(Dataset):
     
 
 def prep_adatas(adatas: list[sc.AnnData], n_neighs: int = 8, log_norm=True) -> list[sc.AnnData]:
-    for i in tqdm(range(len(adatas))):
-        adata = adatas[i]
-        if log_norm:
-            sc.pp.normalize_total(adata)
-            sc.pp.log1p(adata)
-        # sc.pp.scale(adata, zero_center=False)
-        sq.gr.spatial_neighbors(adata, n_neighs=n_neighs)
+    with warnings.catch_warnings(action="ignore"):
+        warnings.simplefilter("ignore")
+        for i in tqdm(range(len(adatas))):
+            adata = adatas[i]
+            if log_norm:
+                sc.pp.normalize_total(adata)
+                sc.pp.log1p(adata)
+            # sc.pp.scale(adata, zero_center=False)
+            sq.gr.spatial_neighbors(adata, n_neighs=n_neighs)
     return adatas
+
 
 def make_dataset(adatas: list[sc.AnnData], sparse_graph=True, mask_var=None) -> Dataset:
     """Create a PyTorch Dataset from a list of adata
@@ -54,8 +58,8 @@ def make_dataset(adatas: list[sc.AnnData], sparse_graph=True, mask_var=None) -> 
         for i in range(1, len(adatas)):
             assert (adatas[i].var[mask_var] == temp).all(), f"Not all adatas have {mask_var} in var"
 
-
     datasets = []
+    unequal_nbs = []
 
     for i in tqdm(range(len(adatas))):
         adata = adatas[i]
@@ -73,7 +77,7 @@ def make_dataset(adatas: list[sc.AnnData], sparse_graph=True, mask_var=None) -> 
         # Gather spatial graph
         if sparse_graph:
             have_equal_deg = True
-            u, v = adata.obsp['spatial_connectivities'].nonzero()
+            v, u = adata.obsp['spatial_connectivities'].nonzero()
             k0 = u.shape[0] / adata.shape[0]
             k = int(np.round(k0))
 
@@ -82,12 +86,11 @@ def make_dataset(adatas: list[sc.AnnData], sparse_graph=True, mask_var=None) -> 
             v = v[order]
 
             if np.abs(k - k0) < 1e-6 and (v.reshape([-1, k]) == np.arange(adata.shape[0])[:, None]).all():
-                print(f"Each cell have {k} neighbors")
                 data_dict['adj'] = torch.from_numpy(np.vstack([u, v]))
             else:
                 ks = np.array(adata.obsp['spatial_connectivities'].sum(axis=0)).squeeze().astype(int)
                 max_k = int(ks.max())
-                print(f"Each cell have at most {max_k} neighbors")
+                unequal_nbs.append(i)
                 aligned_u = np.zeros((adata.shape[0], max_k), dtype=int)
                 aligned_v = np.zeros((adata.shape[0], max_k), dtype=int)
                 align_mask = np.zeros((adata.shape[0], max_k), dtype=int)
@@ -112,4 +115,9 @@ def make_dataset(adatas: list[sc.AnnData], sparse_graph=True, mask_var=None) -> 
 
         datasets.append(data_dict)
         
-    return SpaceFormerDataset(datasets, sparse_graph)
+    if unequal_nbs:
+        print("Not all cells in the following samples have the same number of neighbors:")
+        print(*unequal_nbs, sep=', ', end='.\n')
+        print("Steamboat can handle this. You can safely ignore this warning if this is expected.")
+
+    return SteamboatDataset(datasets, sparse_graph)
