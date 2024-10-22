@@ -1,6 +1,6 @@
 # Steamboat
 
-[![Documentation Status](https://readthedocs.org/projects/spaceformer/badge/?version=latest)](https://spaceformer.readthedocs.io/en/latest/?badge=latest)
+[![Documentation Status](https://readthedocs.org/projects/steamboatomics/badge/?version=latest)](https://steamboatomics.readthedocs.io/en/latest/?badge=latest)
 
 Steamboat is a computational model to decipher short- and long-distance cellular interactions based on the multi-head attention mechanism. 
 
@@ -41,8 +41,8 @@ sf.tools.leiden(adata, resolution=0.1)
 sf.tools.segment(adata, resolution=0.5)
 ```
 
-A [tiny simulation example](https://spaceformer.readthedocs.io/en/latest/tutorial_nbs/tiny_simulation_example.html) is available in our documentation.
+A [tiny simulation example](https://steamboatomics.readthedocs.io/en/latest/tutorial_nbs/tiny_simulation_example.html) is available in our documentation.
 
 ## Documentation
-For the full API and real data examples, please visit our [documentation](https://spaceformer.readthedocs.io/en/latest/).
+For the full API and real data examples, please visit our [documentation](https://steamboatomics.readthedocs.io/en/latest/).
 
