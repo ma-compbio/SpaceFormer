@@ -284,11 +284,12 @@ class BilinearAttention(nn.Module):
     
 class Steamboat(nn.Module):
     def __init__(self, features: list[str] | int, d_ego, d_local, d_global):
-        """Steamboat Model 
+        """Steamboat model
 
-        :param features: input feature (gene) names or the number of features
-        :param local_d: 
-        :param global_d: 
+        :param features: feature names (usuall `adata.var_names` or a column in `adata.var` for gene symbols)
+        :param d_ego: number of ego factors (use only when you know how many you need, otherwise, use local factors instead)
+        :param d_local: number of local factors
+        :param d_global: number of global factors
         """
         super(Steamboat, self).__init__()
 
@@ -302,6 +303,14 @@ class Steamboat(nn.Module):
         self.spatial_gather = BilinearAttention(d_in, d_ego, d_local, d_global, d_in)
 
     def masking(self, x, mask_rate, masking_method):
+        """Masking the dataset
+
+        :param x: input data
+        :param mask_rate: masking rate
+        :param masking_method: full matrix or feature-wise masking
+        :raises ValueError: Unknown random mask method
+        :return: masked data
+        """
         out_x = x.clone()
         # All cells are masked
         if masking_method == 'full':
@@ -318,25 +327,30 @@ class Steamboat(nn.Module):
         return self.spatial_gather(adj_matrix, x, masked_x, sparse_graph=sparse_graph, get_details=get_details)
 
     def fit(self, dataset: SteamboatDataset, 
-            masking_rate=0.0, masking_method='full', 
-            device:str='cuda', 
-            *, orthogonal=0., similarity_penalty=0.0, 
-            opt=None, opt_args=None, max_epoch:int=100, stop_eps=1e-4, stop_tol=10, 
-            loss_fn:str='mse', log_dir:str='log/', report_per=10):
+            masking_rate: float = 0.0, 
+            masking_method: Literal['full', 'feature']='full', 
+            device:str = 'cuda', 
+            *, orthogonal: float = 0., similarity_penalty: float = 0.0, 
+            opt=None, opt_args=None, max_epoch: int = 100, stop_eps: float = 1e-4, stop_tol: int = 10, 
+            loss_fn: str = 'mse', log_dir: str = 'log/', report_per: int = 10):
         """Create a PyTorch Dataset from a list of adata
 
         :param dataset: Dataset to be trained on
+        :param masking_rate: Rate of masking
+        :param masking_method: Method of masking (by "full" or "feature"), default "full"
         :param device: Device to be used ("cpu" or "cuda")
-        :param optim_type: Optimizer for fitting
-        :param lr: Learning rate
-        :param weight_decay: Weight decay factor
-        :param warmup: Use higher training rate for earlier epochs
+        :param orthogonal: Orthogonality penalty
+        :param similarity_penalty: Similarity penalty
+        :param opt: Optimizer for fitting
+        :param opt_args: Arguments for optimizer (e.g., {'lr': 0.01})
         :param max_epoch: maximum number of epochs
+        :param stop_eps: Stopping criterion: minimum change (see also `stop_tol`)
+        :param stop_tol: Stopping criterion: number of epochs that don't meet `stop_eps` before stopping
         :param loss_fn: Loss function for training
         :param log_dir: Directory to save logs
-        :param log_dir: report per how many epoch. 0 to only report before termination. negative number to never report.
+        :param report_per: report per how many epoch. 0 to only report before termination. negative number to never report.
 
-        :return: A `torch.Dataset` including all data.
+        :return: self
         """
         self.train()
 

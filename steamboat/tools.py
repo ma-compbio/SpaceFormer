@@ -25,6 +25,16 @@ def plot_transforms(model: Steamboat, top: int = 3, reorder: bool = False,
                     figsize: str | tuple[float, float] = 'auto', 
                     qkv_colors: list[str] = palettes['npg3'],
                     vmin: float = 0., vmax: float = 1.):
+    """Plot all metagenes
+
+    :param model: Steamboat model
+    :param top: Number of top genes per metagene to plot, defaults to 3
+    :param reorder: Reorder the genes by metagene, or keep the orginal ordering, defaults to False
+    :param figsize: Size of the figure, defaults to 'auto'
+    :param qkv_colors: Colors for the bar plot showing the magnitude of each metagene before normalization, defaults to palettes['npg3']
+    :param vmin: minimum value in the color bar, defaults to 0.
+    :param vmax: maximum value in the color bar, defaults to 1.
+    """
     assert len(qkv_colors) == 3, f"Expect a color palette with at 3 colors, get {len(qkv_colors)}."
     d_ego : int = model.spatial_gather.d_ego
     d_loc : int = model.spatial_gather.d_local
@@ -203,9 +213,18 @@ def plot_transforms(model: Steamboat, top: int = 3, reorder: bool = False,
             fig.add_artist(line)
 
 
-def plot_transform(model, scope, d, 
+def plot_transform(model, scope: Literal['ego', 'local', 'global'], d, 
                    top: int = 3, reorder: bool = False, 
                    figsize: str | tuple[float, float] = 'auto'):
+    """Plot a single set of metagenes (q, k, v)
+
+    :param model: Steamboat model
+    :param scope: type of the factor: 'ego', 'local', 'global'
+    :param d: Number of the head to be plotted
+    :param top: Top genes to plot, defaults to 3
+    :param reorder: Reorder the genes or use the orginal ordering, defaults to False
+    :param figsize: Size of the figure, defaults to 'auto'
+    """
     if scope == 'ego':
         qk_ego, v_ego = model.get_ego_transform()
         assert False, "Not implemented for ego."
@@ -257,7 +276,167 @@ def plot_transform(model, scope, d,
     # ax.get_yaxis().set_visible(False)
 
     plt.tight_layout()
+
+
+
+
+def annotate_adatas(adatas: list[sc.AnnData], dataset: SteamboatDataset, model: Steamboat, 
+                    device='cuda', get_recon=False):
+    """_summary_
+
+    :param adatas: _description_
+    :param dataset: _description_
+    :param model: _description_
+    :param device: _description_, defaults to 'cuda'
+    """
+    # Safeguards
+    assert len(adatas) == len(dataset), "mismatch in lenghths of adatas and dataset"
+    for adata, data in zip(adatas, dataset):
+        assert adata.shape[0] == data[0].shape[0], f"adata[{i}] has {adata.shape[0]} cells but dataset[{i}] has {data[0].shape[0]}."
+
+
+    # Assignments
+    # d_ego: int = model.spatial_gather.d_ego
+    d_local: int = model.spatial_gather.d_local
+    # d_global: int = model.spatial_gather.d_global
+
+    for i, (x, adj) in tqdm(enumerate(dataset), total=len(dataset)):
+            x = x.to(device)
+            adj = adj.to(device)
+            with torch.no_grad():
+                res, details = model(adj, x, x, sparse_graph=True, get_details=True)
+                
+            if get_recon:
+                adatas[i].obsm['X_recon'] = res.cpu().numpy()
+
+            scopes = ['ego', 'local', 'global']
+
+            # raw emb q
+            for which, what in enumerate(scopes):
+                if details['embq'][which] is not None:
+                    adatas[i].obsm[f'X_{what}_q'] = details['embq'][which].cpu().numpy()
+                else:
+                    adatas[i].obsm[f'X_{what}_q'] = np.zeros([adatas[i].shape[0], 0])
+
+            # raw emb k
+            if details['embk'][1] is not None:
+                adatas[i].obsm[f'X_local_k'] = details['embk'][1].cpu().numpy()
+            else:
+                adatas[i].obsm[f'X_local_k'] = np.zeros([adatas[i].shape[0], 0])
+
+            if details['embk'][2] is not None:
+                adatas[i].uns[f'X_global_k'] = details['embk'][2].cpu().numpy()
+            else:
+                adatas[i].uns[f'X_global_k'] = np.zeros([1, 0])
+
+            # attn (as embedding)
+            for which, what in enumerate(scopes):
+                if details['attnm'][which] is not None:
+                    adatas[i].obsm[f'X_{what}_attn'] = details['attnm'][which].cpu().numpy()
+                else:
+                    adatas[i].obsm[f'X_{what}_attn'] = np.zeros([adatas[i].shape[0], 0])
+
+            # local attention (as graph)
+            for j in range(d_local):
+                w = details['attnp'][1].cpu().numpy()[:, j, :].flatten()
+                uv = adj.cpu().numpy()
+                u = uv[0]
+                v = uv[1]
+                if uv.shape[0] == 3: # masked for unequal neighbors
+                    m = (uv[2] > 0)
+                    w, u, v = w[m], u[m], v[m]
+                adatas[i].obsp[f'local_attn_{j}'] = sp.sparse.csr_matrix((w, (u, v)), 
+                                                                         shape=(adatas[i].shape[0], 
+                                                                                adatas[i].shape[0]))
+
+
+def gather_obsm(adata: sc.AnnData, adatas: list[sc.AnnData]):
+    """_summary_
+
+    :param adata: _description_
+    :param adatas: _description_
+    """
+    pass
+
+
+def neighbors(adata: sc.AnnData,
+              use_rep: str = 'X_local_q', 
+              key_added: str = 'steamboat_emb',
+              metric='cosine', 
+              neighbors_kwargs: dict = None):
+    """A thin wrapper for scanpy.pp.neighbors for Steamboat functionalities
+
+    :param adata: AnnData object to be processed
+    :param use_rep: embedding to be used, 'X_local_q' or 'X_local_attn' (if very noisy data), defaults to 'X_local_q'
+    :param key_added: key in obsp to store the resulting similarity graph, defaults to 'steamboat_emb'
+    :param metric: metric for similarity graph, defaults to 'cosine'
+    :param neighbors_kwargs: Other parameters for scanpy.pp.neighbors if desired, defaults to None
+    :return: hands over what scanpy.pp.neighbors returns
+    """
+    if neighbors_kwargs is None:
+        neighbors_kwargs = {}
+    return sc.pp.neighbors(adata, use_rep=use_rep, key_added=key_added, metric=metric, **neighbors_kwargs)
+
+
+def leiden(adata: sc.AnnData, resolution: float = 1., *,
+            obsp='steamboat_emb_connectivities',
+            key_added='steamboat_clusters',
+            leiden_kwargs: dict = None):
+    """A thin wrapper for scanpy.tl.leiden to cluster for cell types (for spatial domain segmentation, use `segment`).
+
+    :param adata: AnnData object to be processed
+    :param resolution: resolution for Leiden clustering, defaults to 1.
+    :param obsp: obsp key to be used, defaults to 'steamboat_emb_connectivities'
+    :param key_added: obs key to be added for resulting clusters, defaults to 'steamboat_clusters'
+    :param leiden_kwargs: Other parameters for scanpy.tl.leiden if desired, defaults to None
+    :return: hands over what scanpy.tl.leiden returns
+    """
+    if leiden_kwargs is None:
+        leiden_kwargs = {}
+    return sc.tl.leiden(adata, obsp=obsp, key_added=key_added, resolution=resolution, **leiden_kwargs)
     
+
+def segment(adata: sc.AnnData, resolution: float = 1., *,
+            embedding_key: str = 'steamboat_emb_connectivities',
+            key_added: str = 'steamboat_spatial_domain',
+            obsp_summary: str = 'steamboat_summary_connectivities',
+            obsp_combined: str = 'steamboat_combined_connectivities', 
+            spatial_graph_threshold: float = 0.0,
+            leiden_kwargs: dict = None):
+    """Spatial domain segmentation using Steamboat embeddings and graphs
+
+    :param adata: AnnData object to be processed
+    :param resolution: resolution for Leiden clustering, defaults to 1.
+    :param embedding_key: key in obsp for similarity graph (by running `neighbors`), defaults to 'steamboat_emb_connectivities'
+    :param key_added: obs key for semgentaiton result, defaults to 'steamboat_spatial_domain'
+    :param obsp_summary: obsp key for summary spatial graph, defaults to 'steamboat_summary_connectivities'
+    :param obsp_combined: obsp key for combined spatial and similarity graphs, defaults to 'steamboat_combined_connectivities'
+    :param spatial_graph_threshold: threshold to include/exclude an edge, a larger number will make the program run faster but potentially less accurate, defaults to 0.0
+    :param leiden_kwargs: Other parameters for scanpy.tl.leiden if desired, defaults to None
+    :return: _descripthands over what scanpy.tl.leiden returnsion_
+    """
+    if leiden_kwargs is None:
+        leiden_kwargs = {}
+
+    temp = None
+    j = 0
+    while f'local_attn_{j}' in adata.obsp:
+        if temp is None:
+            temp = adata.obsp[f'local_attn_{j}'].copy() ** 4
+        else:
+            temp += adata.obsp[f'local_attn_{j}'] ** 4
+        j += 1
+    temp = temp.sqrt().sqrt()
+    temp.data /= temp.data.max()
+    temp.data[temp.data < spatial_graph_threshold] = 0
+    temp.eliminate_zeros()
+    adata.obsp[obsp_summary] = temp
+    adata.obsp[obsp_combined] = adata.obsp[embedding_key] * (adata.obsp[obsp_summary]) + (adata.obsp[obsp_summary])
+    adata.obsp[obsp_combined].eliminate_zeros() 
+    return sc.tl.leiden(adata, obsp=obsp_combined, key_added=key_added, resolution=resolution, **leiden_kwargs)
+
+
+
 
 def plot_transforms_combined(model, top=3, reorder=False, figsize='auto'):
     d_ego = model.spatial_gather.d_ego
@@ -381,148 +560,3 @@ def plot_transforms_combined(model, top=3, reorder=False, figsize='auto'):
     
     fig.align_xlabels()
     plt.tight_layout()
-
-
-def annotate_adatas(adatas: list[sc.AnnData], dataset: SteamboatDataset, model: Steamboat, 
-                    device='cuda', get_recon=False):
-    """_summary_
-
-    :param adatas: _description_
-    :param dataset: _description_
-    :param model: _description_
-    :param device: _description_, defaults to 'cuda'
-    """
-    # Safeguards
-    assert len(adatas) == len(dataset), "mismatch in lenghths of adatas and dataset"
-    for adata, data in zip(adatas, dataset):
-        assert adata.shape[0] == data[0].shape[0], f"adata[{i}] has {adata.shape[0]} cells but dataset[{i}] has {data[0].shape[0]}."
-
-
-    # Assignments
-    # d_ego: int = model.spatial_gather.d_ego
-    d_local: int = model.spatial_gather.d_local
-    # d_global: int = model.spatial_gather.d_global
-
-    for i, (x, adj) in tqdm(enumerate(dataset), total=len(dataset)):
-            x = x.to(device)
-            adj = adj.to(device)
-            with torch.no_grad():
-                res, details = model(adj, x, x, sparse_graph=True, get_details=True)
-                
-            if get_recon:
-                adatas[i].obsm['X_recon'] = res.cpu().numpy()
-
-            scopes = ['ego', 'local', 'global']
-
-            # raw emb q
-            for which, what in enumerate(scopes):
-                if details['embq'][which] is not None:
-                    adatas[i].obsm[f'X_{what}_q'] = details['embq'][which].cpu().numpy()
-                else:
-                    adatas[i].obsm[f'X_{what}_q'] = np.zeros([adatas[i].shape[0], 0])
-
-            # raw emb k
-            if details['embk'][1] is not None:
-                adatas[i].obsm[f'X_local_k'] = details['embk'][1].cpu().numpy()
-            else:
-                adatas[i].obsm[f'X_local_k'] = np.zeros([adatas[i].shape[0], 0])
-
-            if details['embk'][2] is not None:
-                adatas[i].uns[f'X_global_k'] = details['embk'][2].cpu().numpy()
-            else:
-                adatas[i].uns[f'X_global_k'] = np.zeros([1, 0])
-
-            # attn (as embedding)
-            for which, what in enumerate(scopes):
-                if details['attnm'][which] is not None:
-                    adatas[i].obsm[f'X_{what}_attn'] = details['attnm'][which].cpu().numpy()
-                else:
-                    adatas[i].obsm[f'X_{what}_attn'] = np.zeros([adatas[i].shape[0], 0])
-
-            # local attention (as graph)
-            for j in range(d_local):
-                w = details['attnp'][1].cpu().numpy()[:, j, :].flatten()
-                uv = adj.cpu().numpy()
-                u = uv[0]
-                v = uv[1]
-                if uv.shape[0] == 3: # masked for unequal neighbors
-                    m = (uv[2] > 0)
-                    w, u, v = w[m], u[m], v[m]
-                adatas[i].obsp[f'local_attn_{j}'] = sp.sparse.csr_matrix((w, (u, v)), 
-                                                                         shape=(adatas[i].shape[0], 
-                                                                                adatas[i].shape[0]))
-
-
-def gather_obsm(adata: sc.AnnData, adatas: list[sc.AnnData]):
-    """_summary_
-
-    :param adata: _description_
-    :param adatas: _description_
-    """
-    pass
-
-
-def neighbors(adata: sc.AnnData, 
-              use_rep: str = 'X_local_q', 
-              key_added: str = 'steamboat_emb',
-              metric='cosine', 
-              neighbors_kwargs: dict = None):
-    """A thin wrapper for scanpy.pp.neighbors for Steamboat functionalities
-
-    :param adata: AnnData object to be processed
-    :param use_rep: embedding to be used, 'X_local_q' or 'X_local_attn' (if very noisy data), defaults to 'X_local_q'
-    :param key_added: key in obsp to store the resulting similarity graph, defaults to 'steamboat_emb'
-    :param metric: metric for similarity graph, defaults to 'cosine'
-    :param neighbors_kwargs: Other parameters for scanpy.pp.neighbors if desired, defaults to None
-    :return: hands over what scanpy.pp.neighbors returns
-    """
-    if neighbors_kwargs is None:
-        neighbors_kwargs = {}
-    return sc.pp.neighbors(adata, use_rep=use_rep, key_added=key_added, metric=metric, **neighbors_kwargs)
-
-
-def leiden(adata: sc.AnnData,
-            obsp='steamboat_emb_connectivities',
-            key_added='steamboat_clusters',
-            resolution: float = 1.,
-            leiden_kwargs: dict = None):
-    """A thin wrapper for scanpy.tl.leiden to cluster for cell types (for spatial domain segmentation, use `segment`).
-
-    :param adata: AnnData object to be processed
-    :param obsp: obsp key to be used, defaults to 'steamboat_emb_connectivities'
-    :param key_added: obs key to be added for resulting clusters, defaults to 'steamboat_clusters'
-    :param resolution: resolution for Leiden clustering, defaults to 1.
-    :param leiden_kwargs: Other parameters for scanpy.tl.leiden if desired, defaults to None
-    :return: hands over what scanpy.tl.leiden returns
-    """
-    if leiden_kwargs is None:
-        leiden_kwargs = {}
-    return sc.tl.leiden(adata, obsp=obsp, key_added=key_added, resolution=resolution, **leiden_kwargs)
-    
-
-def segment(adata: sc.AnnData, resolution: float = 1., *,
-            embedding_key: str = 'steamboat_emb_connectivities',
-            key_added: str = 'steamboat_spatial_domain',
-            obsp_summary: str = 'steamboat_summary_connectivities',
-            obsp_combined: str = 'steamboat_combined_connectivities', 
-            spatial_graph_threshold: float = 0.0,
-            leiden_kwargs: dict = None):
-    if leiden_kwargs is None:
-        leiden_kwargs = {}
-
-    temp = None
-    j = 0
-    while f'local_attn_{j}' in adata.obsp:
-        if temp is None:
-            temp = adata.obsp[f'local_attn_{j}'].copy() ** 4
-        else:
-            temp += adata.obsp[f'local_attn_{j}'] ** 4
-        j += 1
-    temp = temp.sqrt().sqrt()
-    temp.data /= temp.data.max()
-    temp.data[temp.data < spatial_graph_threshold] = 0
-    temp.eliminate_zeros()
-    adata.obsp[obsp_summary] = temp
-    adata.obsp[obsp_combined] = adata.obsp[embedding_key] * (adata.obsp[obsp_summary]) + (adata.obsp[obsp_summary])
-    adata.obsp[obsp_combined].eliminate_zeros() 
-    return sc.tl.leiden(adata, obsp=obsp_combined, key_added=key_added, resolution=resolution, **leiden_kwargs)

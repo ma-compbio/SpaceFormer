@@ -11,6 +11,11 @@ import warnings
 
 class SteamboatDataset(Dataset):
     def __init__(self, data_list, sparse_graph):
+        """Steamboat Dataset class
+
+        :param data_list: a list of dictionaries containing 'X' and 'adj' keys
+        :param sparse_graph: Whether to use adjacency list or adjacency matrix
+        """
         super().__init__()
         self.data = data_list
         self.sparse_graph = sparse_graph
@@ -24,6 +29,13 @@ class SteamboatDataset(Dataset):
     
 
 def prep_adatas(adatas: list[sc.AnnData], n_neighs: int = 8, log_norm=True) -> list[sc.AnnData]:
+    """Preprocess a list of AnnData objects
+
+    :param adatas: A list of `SCANPY AnnData`
+    :param n_neighs: number of neighbors for kNN spatial graph, defaults to 8
+    :param log_norm: Whether or not to normalize and log-transform the data, defaults to True
+    :return: A list of preprocessed `SCANPY AnnData`
+    """
     with warnings.catch_warnings(action="ignore"):
         warnings.simplefilter("ignore")
         for i in tqdm(range(len(adatas))):
